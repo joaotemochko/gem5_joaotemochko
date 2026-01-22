@@ -8,7 +8,7 @@ This project is developed within the scope of research activities at **Centro Un
 
 This custom version of gem5 includes:
 
-* **IFA Architecture:** Implementation of the *Instruction Flow Amplifier* logic, designed to optimize instruction flow and enhance single-thread performance.
+* **IFA Architecture:** Implementation of the *Instruction Flow Accelerator* logic, designed to optimize instruction flow and enhance single-thread performance.
 * **ISA Support:** Configurations tested and validated for **RISC-V** and **ARM** architectures.
 * **McPAT Integration:** Custom scripts and parsers developed to convert gem5 output statistics (`stats.txt`, `config.json`) into **McPAT** compatible XML formats, enabling accurate power and area estimation.
 * **Benchmarks:** Support and configuration scripts for running the **MiBench** suite (including *basicmath* and *blowfish*) to validate the architecture.
