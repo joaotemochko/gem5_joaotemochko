@@ -134,8 +134,75 @@ parser = argparse.ArgumentParser()
 Options.addCommonOptions(parser)
 Options.addSEOptions(parser)
 
-parser.add_argument("--enable-ifa", action="store_true", default=False,
-                    help="Ativa o Instruction Flow Amplifier (IFA) na MinorCPU")
+parser.add_argument(
+    "--ifa-mode",
+    type=int,
+    default=0,
+    choices=[0, 1, 2],
+    help="Instruction Flow Amplifier (IFA) in the MinorCPU Fetch2 stage:"
+    " 0 = off (baseline), 1 = front-end buffer with in-order dispatch,"
+    " 2 = front-end buffer with out-of-order dispatch",
+)
+parser.add_argument(
+    "--ifa-buffer-size", type=int, default=16, help="IFA FEB entries"
+)
+parser.add_argument(
+    "--ifa-decode-width",
+    type=int,
+    default=0,
+    help="Instructions decoded into the IFA FEB per cycle (0: no limit)",
+)
+parser.add_argument(
+    "--ifa-latency",
+    type=int,
+    default=0,
+    help="Cycles an instruction spends in the IFA FEB before dispatch",
+)
+parser.add_argument(
+    "--ifa-dau-source",
+    default="IFAHybrid",
+    choices=["IFAShadow", "IFAScoreboard", "IFAHybrid"],
+    help="Where the IFA DAU finds in-flight producers",
+)
+parser.add_argument(
+    "--ifa-load-latency",
+    type=int,
+    default=4,
+    help="Load-to-use latency assumed by the IFA shadow scoreboard",
+)
+parser.add_argument(
+    "--ifa-issue-model",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Schedule IFA dispatch with a model of Execute's in-order issue"
+    " (otherwise oldest ready first)",
+)
+parser.add_argument(
+    "--ifa-hoist-memory-refs",
+    action="store_true",
+    help="Let memory references pass older independent instructions",
+)
+parser.add_argument(
+    "--ifa-fill-when-blocked",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Keep filling the IFA FEB while Decode is full",
+)
+parser.add_argument(
+    "--ifa-queue-aware",
+    action="store_true",
+    help="Include queued instructions in the IFA DAU's arrival estimate",
+)
+parser.add_argument(
+    "--ifa-pass-memory-refs",
+    action="store_true",
+    help="Let re-executable instructions pass older memory references",
+)
+parser.add_argument(
+    "--ifa-no-flush",
+    action="store_true",
+    help="Don't discard IFA FEB entries on stream changes",
+)
 
 if "--ruby" in sys.argv:
     Ruby.define_options(parser)
@@ -219,20 +286,28 @@ system.cpu_clk_domain = SrcClockDomain(
 if args.elastic_trace_en:
     CpuConfig.config_etrace(CPUClass, system.cpu, args)
 
-# Configuração do IFA (Instruction Flow Amplifier)
-if args.enable_ifa:
-    print("info: Ativando Instruction Flow Amplifier (IFA) em todas as CPUs...")
-    for cpu in system.cpu:
-        # Verifica dinamicamente se a CPU possui o parâmetro para evitar erros
-        if hasattr(cpu, 'enableIFA'):
-            cpu.enableIFA = True
-        else:
-            print(f"warn: A CPU atual ({type(cpu).__name__}) não suporta 'enableIFA'. Ignorando.")
-
 # All cpus belong to a common cpu_clk_domain, therefore running at a common
 # frequency.
 for cpu in system.cpu:
     cpu.clk_domain = system.cpu_clk_domain
+
+# Instruction Flow Amplifier (MinorCPU only)
+for cpu in system.cpu:
+    if "ifa_mode" in cpu._params:
+        cpu.ifa_mode = args.ifa_mode
+        cpu.ifa_buffer_size = args.ifa_buffer_size
+        cpu.ifa_decode_width = args.ifa_decode_width
+        cpu.ifa_latency = args.ifa_latency
+        cpu.ifa_dau_source = args.ifa_dau_source
+        cpu.ifa_load_latency = args.ifa_load_latency
+        cpu.ifa_flush_on_stream_change = not args.ifa_no_flush
+        cpu.ifa_pass_memory_refs = args.ifa_pass_memory_refs
+        cpu.ifa_hoist_memory_refs = args.ifa_hoist_memory_refs
+        cpu.ifa_issue_model = args.ifa_issue_model
+        cpu.ifa_fill_when_blocked = args.ifa_fill_when_blocked
+        cpu.ifa_queue_aware = args.ifa_queue_aware
+    elif args.ifa_mode != 0:
+        fatal(f"--ifa-mode needs a MinorCPU, not {type(cpu).__name__}")
 
 if ObjectList.is_kvm_cpu(CPUClass) or ObjectList.is_kvm_cpu(FutureClass):
     if buildEnv["USE_X86_ISA"]:

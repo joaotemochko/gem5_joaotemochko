@@ -79,6 +79,11 @@ Execute::Execute(const std::string &name_, MinorCPU &cpu_,
       setTraceTimeOnIssue(params.executeSetTraceTimeOnIssue),
       allowEarlyMemIssue(params.executeAllowEarlyMemoryIssue),
       noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
+      ifaNeedsScoreboard(params.ifa_mode != 0 &&
+          params.ifa_dau_source != enums::IFAShadow),
+      ifaInputOccupancy(params.numThreads, 0),
+      ifaNextInputOccupancy(params.numThreads, 0),
+      inputBufferSize(params.executeInputBufferSize),
       lsq(name_ + ".lsq", name_ + ".dcache_port", cpu_, *this,
           params.executeMaxAccessesInMemory, params.executeMemoryWidth,
           params.executeLSQRequestsQueueSize,
@@ -90,6 +95,7 @@ Execute::Execute(const std::string &name_, MinorCPU &cpu_,
       interruptPriority(0),
       issuePriority(0),
       commitPriority(0),
+      issueStop(IssueStopNoInput),
       issueStats(&cpu_)
 {
     if (commitLimit < 1) {
@@ -180,6 +186,10 @@ Execute::Execute(const std::string &name_, MinorCPU &cpu_,
 
         /* Scoreboards */
         scoreboard.emplace_back(name_ + ".scoreboard" + tid_str, regClasses);
+        if (ifaNeedsScoreboard) {
+            ifaScoreboardSnapshot.emplace_back(
+                name_ + ".ifaScoreboardSnapshot" + tid_str, regClasses);
+        }
 
         /* In-flight instruction records */
         executeInfo[tid].inFlightInsts =  new Queue<QueuedInst,
@@ -353,6 +363,7 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
             /* Take the fault raised during the TLB/memory access */
             fault = inst->translationFault;
 
+            ifaPrepareFault(inst, thread);
             fault->invoke(thread, inst->staticInst);
         }
     } else if (!packet) {
@@ -385,6 +396,7 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
             /* Invoke fault created by instruction completion */
             DPRINTF(MinorMem, "Fault in memory completeAcc: %s\n",
                 fault->name());
+            ifaPrepareFault(inst, thread);
             fault->invoke(thread, inst->staticInst);
         } else {
             /* Stores need to be pushed into the store buffer to finish
@@ -546,8 +558,14 @@ Execute::issue(ThreadID thread_id)
     ExecuteThreadInfo &thread = executeInfo[thread_id];
 
     /* Early termination if we have no instructions */
-    if (!insts_in)
+    if (!insts_in) {
+        issueStop = IssueStopNoInput;
         return 0;
+    }
+
+    /* Why the instruction being tried could not be issued */
+    bool failed_operands = false;
+    bool failed_fu = false;
 
     /* Start from the first FU */
     unsigned int fu_index = 0;
@@ -591,6 +609,8 @@ Execute::issue(ThreadID thread_id)
             /* Try and issue an instruction into an FU, assume we didn't and
              * fix that in the loop */
             issued = false;
+            failed_operands = false;
+            failed_fu = false;
 
             /* Try FU from 0 each instruction */
             fu_index = 0;
@@ -637,6 +657,8 @@ Execute::issue(ThreadID thread_id)
 
                 } else if (!fu_is_capable || fu->alreadyPushed()) {
                     /* Skip */
+                    if (fu_is_capable)
+                        failed_fu = true;
                     if (!fu_is_capable) {
                         DPRINTF(MinorExecute, "Can't issue as FU: %d isn't"
                             " capable\n", fu_index);
@@ -645,10 +667,12 @@ Execute::issue(ThreadID thread_id)
                             " already busy\n", fu_index);
                     }
                 } else if (fu->stalled) {
+                    failed_fu = true;
                     DPRINTF(MinorExecute, "Can't issue inst: %s into FU: %d,"
                         " it's stalled\n",
                         *inst, fu_index);
                 } else if (!fu->canInsert()) {
+                    failed_fu = true;
                     DPRINTF(MinorExecute, "Can't issue inst: %s to busy FU"
                         " for another: %d cycles\n",
                         *inst, fu->cyclesBeforeInsert());
@@ -671,6 +695,7 @@ Execute::issue(ThreadID thread_id)
                         src_latencies, cant_forward_from_fu_indices,
                         cpu.curCycle(), cpu.getContext(thread_id)))
                     {
+                        failed_operands = true;
                         DPRINTF(MinorExecute, "Can't issue inst: %s yet\n",
                             *inst);
                     } else {
@@ -841,6 +866,19 @@ Execute::issue(ThreadID thread_id)
         num_insts_issued != issueLimit && /* Still allowed to issue */
         num_mem_insts_issued != memoryIssueLimit);
 
+    if (!issued) {
+        issueStop = (failed_operands ? IssueStopOperands :
+            (failed_fu ? IssueStopFU : IssueStopOther));
+    } else if (num_insts_issued == issueLimit) {
+        issueStop = IssueStopFull;
+    } else if (insts_in && thread.inputIndex < insts_in->width() &&
+        num_mem_insts_issued == memoryIssueLimit)
+    {
+        issueStop = IssueStopMemLimit;
+    } else {
+        issueStop = IssueStopNoInput;
+    }
+
     return num_insts_issued;
 }
 
@@ -1009,6 +1047,7 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
             } else {
                 DPRINTF(MinorExecute, "Fault in execute: %s\n",
                     fault->name());
+                ifaPrepareFault(inst, thread);
                 fault->invoke(thread, NULL);
 
                 tryToBranch(inst, fault, branch);
@@ -1497,6 +1536,21 @@ Execute::evaluate()
 
     unsigned int num_issued = 0;
 
+    /* Remember the scoreboard and input buffer as they were at the end of
+     *  the last cycle for Fetch2's IFA, which is evaluated after this stage */
+    ifaInputOccupancy = ifaNextInputOccupancy;
+    if (ifaNeedsScoreboard) {
+        for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
+            Scoreboard &snapshot = ifaScoreboardSnapshot[tid];
+
+            snapshot.numResults = scoreboard[tid].numResults;
+            snapshot.numUnpredictableResults =
+                scoreboard[tid].numUnpredictableResults;
+            snapshot.fuIndices = scoreboard[tid].fuIndices;
+            snapshot.returnCycle = scoreboard[tid].returnCycle;
+        }
+    }
+
     /* Do all the cycle-wise activities for dcachePort here to potentially
      *  free up input spaces in the LSQ's requests queue */
     lsq.step();
@@ -1567,6 +1621,9 @@ Execute::evaluate()
             DPRINTF(MinorExecute, "Attempting to issue [tid:%d]\n",
                     issue_tid);
             num_issued = issue(issue_tid);
+            issueStats.issueStopCycles[issueStop]++;
+        } else {
+            issueStats.issueStopCycles[IssueStopNoInput]++;
         }
 
     }
@@ -1672,6 +1729,11 @@ Execute::evaluate()
     /* Make sure the input (if any left) is pushed */
     if (!inp.outputWire->isBubble())
         inputBuffer[inp.outputWire->threadId].pushTail();
+
+    for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
+        ifaNextInputOccupancy[tid] = inputBufferSize -
+            inputBuffer[tid].unreservedRemainingSpace();
+    }
 }
 
 ThreadID
@@ -1718,6 +1780,43 @@ Execute::hasInterrupt(ThreadID thread_id)
     }
 
     return false;
+}
+
+void
+Execute::ifaPrepareFault(MinorDynInstPtr inst, ThreadContext *thread)
+{
+    /* Instructions older than inst which the IFA let it pass have not been
+     *  executed.  Fault from the oldest of them, as if it had faulted:
+     *  everything older has committed and nothing younger has */
+    if (inst->ifaRestartPC) {
+        DPRINTF(MinorExecute, "IFA restarting fault in inst: %s from: %s\n",
+            *inst, *inst->ifaRestartPC);
+        thread->pcState(*inst->ifaRestartPC);
+    }
+}
+
+Execute::IFARegState
+Execute::ifaRegState(ThreadID thread_id, const RegId &reg) const
+{
+    assert(ifaNeedsScoreboard);
+
+    const Scoreboard &snapshot = ifaScoreboardSnapshot[thread_id];
+    IFARegState state;
+    Scoreboard::Index index;
+
+    if (snapshot.findIndex(reg, index) && snapshot.numResults[index] != 0) {
+        int fu_index = snapshot.fuIndices[index];
+
+        state.pending = true;
+        /* Memory references hold their destinations in the scoreboard until
+         *  they commit, so this is exact even for cache misses */
+        state.memPending = snapshot.numUnpredictableResults[index] != 0 ||
+            (fu_index >= 0 && fu_index < numFuncUnits &&
+                funcUnits[fu_index]->provides(MemReadOp));
+        state.returnCycle = snapshot.returnCycle[index];
+    }
+
+    return state;
 }
 
 void
@@ -1965,8 +2064,23 @@ Execute::getDcachePort()
 Execute::IssueStats::IssueStats(MinorCPU *cpu)
     : statistics::Group(cpu),
       ADD_STAT(issuedInstType, statistics::units::Count::get(),
-               "Number of instructions issued per FU type, per thread")
+               "Number of instructions issued per FU type, per thread"),
+      ADD_STAT(issueStopCycles, statistics::units::Cycle::get(),
+               "Number of cycles by why Execute stopped issuing: Full ="
+               " issued executeIssueLimit instructions, NoInput = nothing"
+               " (more) to issue, Operands = sources of the next instruction"
+               " not ready, FU = no FU could take it, MemLimit ="
+               " executeMemoryIssueLimit reached")
 {
+    issueStopCycles.init(NumIssueStop)
+        .subname(IssueStopFull, "Full")
+        .subname(IssueStopNoInput, "NoInput")
+        .subname(IssueStopOperands, "Operands")
+        .subname(IssueStopFU, "FU")
+        .subname(IssueStopMemLimit, "MemLimit")
+        .subname(IssueStopOther, "Other")
+        .flags(statistics::total | statistics::pdf);
+
     issuedInstType.init(cpu->numThreads, enums::Num_OpClass)
         .flags(statistics::total | statistics::pdf | statistics::dist);
     issuedInstType.ysubnames(enums::OpClassStrings);

@@ -45,16 +45,18 @@
 #ifndef __CPU_MINOR_FETCH2_HH__
 #define __CPU_MINOR_FETCH2_HH__
 
+#include <deque>
 #include <vector>
 
 #include "base/named.hh"
 #include "cpu/minor/buffers.hh"
 #include "cpu/minor/cpu.hh"
+#include "cpu/minor/execute.hh"
 #include "cpu/minor/pipe_data.hh"
+#include "cpu/minor/scoreboard.hh"
 #include "cpu/pred/bpred_unit.hh"
+#include "enums/MinorIFADAUSource.hh"
 #include "params/BaseMinorCPU.hh"
-#include <deque>
-#include "cpu/minor/dyn_inst.hh"
 
 namespace gem5
 {
@@ -96,14 +98,125 @@ class Fetch2 : public Named
     /** Branch predictor passed from Python configuration */
     branch_prediction::BPredUnit &branchPredictor;
 
-    /** IFA Buffer para janela de instruções (Janela deslizante) */
-    std::deque<MinorDynInstPtr> ifaBuffer;
+    /** Instruction Flow Amplifier (IFA) mode.  0: baseline Fetch2 (IFA
+     *  off).  1: decoded instructions go through the front-end buffer
+     *  (FEB) and leave it in program order.  2: the dispatch unit (DU)
+     *  sends the oldest instructions the dependency analysis unit (DAU)
+     *  finds ready, which may skip a blocked head */
+    const unsigned int ifaMode;
 
-    /** IFA Contador de ciclos de latência restantes para o lote atual */
-    Cycles ifaLatencyCounter;
+    /** Number of FEB entries */
+    const unsigned int ifaBufferSize;
 
-    /** IFA Verifica se estamos em estado de "Stall" provocado pelo IFA */
-    bool isIFAStalled;
+    /** Maximum number of instructions decoded into the FEB each cycle.
+     *  0 means no limit other than FEB space and available input */
+    const unsigned int ifaDecodeWidth;
+
+    /** Cycles an instruction spends in the FEB before it can be
+     *  dispatched.  0 allows dispatch in the cycle it is decoded */
+    const Cycles ifaLatency;
+
+    /** Discard FEB entries from the old stream when Execute changes
+     *  stream.  If false, they are dispatched and dropped by Execute */
+    const bool ifaFlushOnStreamChange;
+
+    /** Where the DAU finds producers which are still in flight */
+    const enums::MinorIFADAUSource ifaDAUSource;
+
+    /** Load-to-use latency assumed by the shadow scoreboard */
+    const Cycles ifaLoadLatency;
+
+    /** Allow instructions which can be executed again with the same result
+     *  to pass older memory references.  If such a memory reference
+     *  faults (for example, a stack page fault in SE mode), the passing
+     *  instructions are executed and committed again after the fault */
+    const bool ifaPassMemoryRefs;
+
+    /** Allow memory references to be dispatched before older (non memory)
+     *  instructions they don't depend on, so that they start earlier.
+     *  Only the first instruction to pass the head may be a memory
+     *  reference, and if it faults, Execute restarts from the head
+     *  (MinorDynInst::ifaRestartPC), keeping faults precise */
+    const bool ifaHoistMemoryRefs;
+
+    /** Keep decoding into the FEB while Decode can't accept instructions */
+    const bool ifaFillWhenBlocked;
+
+    /** Include the instructions queued between Fetch2 and issue in the
+     *  DAU's estimate of when an instruction will reach issue */
+    const bool ifaQueueAware;
+
+    /** Capacity of Decode's input buffer */
+    const unsigned int decodeInputBufferSize;
+
+    /** Choose what to dispatch with a model of Execute's in-order issue:
+     *  the instruction which would issue earliest goes first, so a younger
+     *  instruction only passes the head if it would issue before it.  If
+     *  false, the oldest ready instruction goes first */
+    const bool ifaIssueModel;
+
+    /** Execute's executeIssueLimit */
+    const unsigned int ifaIssueLimit;
+
+    /** Issue model: by OpClass, as Execute's FUs see it: the latency
+     *  added to the issue cycle to give the scoreboard's returnCycle, the
+     *  source relative latencies, the FU used and its issue latency */
+    std::vector<Cycles> ifaFUOpLat;
+    std::vector<std::vector<Cycles>> ifaFURelLats;
+    std::vector<int> ifaOpFU;
+    std::vector<Cycles> ifaFUIssueLat;
+
+    /** Issue model state: the estimated issue cycle of the last dispatched
+     *  instruction, the number issued in that cycle, whether one of them
+     *  was a memory reference (which ends Execute's issue for the cycle)
+     *  and, by FU, the first cycle it can accept an instruction */
+    Cycles ifaModelLastIssue;
+    unsigned int ifaModelNumAtLast;
+    bool ifaModelMemAtLast;
+    std::vector<Cycles> ifaModelFUFree;
+
+    /** Execute, whose scoreboard the DAU reads */
+    const Execute &execute;
+
+    /** Earliest number of cycles between an instruction leaving Fetch2
+     *  and it reaching issue in Execute */
+    const Cycles ifaDispatchToIssue;
+
+    /** An FEB entry */
+    struct IFAEntry
+    {
+        MinorDynInstPtr inst;
+
+        /** Cycle at which the entry can first be dispatched */
+        Cycles dispatchableCycle;
+    };
+
+    /** The FEB, oldest instruction first.  Entries leave it when they are
+     *  dispatched, so the front is always the oldest undispatched
+     *  instruction (the head) */
+    std::deque<IFAEntry> ifaBuffer;
+
+    /** Shadow scoreboard.  Only its register indexing and returnCycle are
+     *  used: returnCycle holds, for each register, the estimated cycle
+     *  from which an instruction can issue in Execute after reading the
+     *  value of the last dispatched instruction writing that register */
+    Scoreboard ifaShadow;
+
+    /** Estimated cycles between a producer and a consumer issuing, by the
+     *  producer's OpClass.  Taken from the Execute FU descriptions,
+     *  except for memory operations, which use ifaLoadLatency */
+    std::vector<Cycles> ifaOpLatency;
+
+    /** Relative latency at which an integer consumer reads its sources,
+     *  used when comparing against Execute's own returnCycle */
+    Cycles ifaSrcRelativeLatency;
+
+    /** Estimated cycle at which instructions dispatched in this cycle reach
+     *  issue in Execute */
+    Cycles ifaArrival;
+
+    /** Youngest (largest fetchSeqNum) instruction dispatched so far */
+    InstSeqNum ifaMaxDispatchedSeqNum;
 
   public:
     /* Public so that Pipeline can pass it to Fetch1 */
@@ -173,7 +286,7 @@ class Fetch2 : public Named
 
     struct Fetch2Stats : public statistics::Group
     {
-        Fetch2Stats(MinorCPU *cpu);
+        Fetch2Stats(MinorCPU *cpu, unsigned int ifa_buffer_size);
         /** Stats */
         statistics::Scalar totalInstructions;
         statistics::Scalar intInstructions;
@@ -182,6 +295,18 @@ class Fetch2 : public Named
         statistics::Scalar loadInstructions;
         statistics::Scalar storeInstructions;
         statistics::Scalar amoInstructions;
+
+        /** IFA stats */
+        statistics::Scalar ifaDispatched;
+        statistics::Scalar ifaDispatchedOutOfOrder;
+        statistics::Scalar ifaHoisted;
+        statistics::Scalar ifaSkipped;
+        statistics::Scalar ifaHeadBlockedCycles;
+        statistics::Scalar ifaReorderCycles;
+        statistics::Scalar ifaBufferFullCycles;
+        statistics::Scalar ifaFlushes;
+        statistics::Scalar ifaFlushedInsts;
+        statistics::Distribution ifaOccupancy;
     } stats;
 
   protected:
@@ -209,10 +334,39 @@ class Fetch2 : public Named
      *  fetch from. */
     ThreadID getScheduledThread();
 
+    /** IFA: does this instruction have to leave the FEB in program order?
+     *  Nothing younger may pass it and it may not pass anything older */
+    bool ifaIsBarrier(const MinorDynInstPtr &inst) const;
+
+    /** IFA: DAU test that all the sources of inst will be available when
+     *  it reaches issue, if it is dispatched now */
+    bool ifaSourcesReady(const MinorDynInstPtr &inst);
+
+    /** IFA: DAU test that inst can be dispatched before all the (older)
+     *  instructions in skipped, which are still in the FEB */
+    bool ifaCanPass(const MinorDynInstPtr &inst,
+        const std::vector<MinorDynInstPtr> &skipped) const;
+
+    /** IFA: note the destinations of a dispatched instruction in the shadow
+     *  scoreboard */
+    void ifaMarkupDispatch(const MinorDynInstPtr &inst);
+
+    /** IFA: dispatch instructions from the FEB into insts_out */
+    void ifaDispatch(ForwardInstData &insts_out);
+
+    /** IFA issue model: the cycle in which inst would issue in Execute if
+     *  it were dispatched next */
+    Cycles ifaEstimateIssue(const MinorDynInstPtr &inst) const;
+
+    /** IFA issue model: account for inst being dispatched to issue at
+     *  issue_cycle */
+    void ifaModelDispatch(const MinorDynInstPtr &inst, Cycles issue_cycle);
+
   public:
     Fetch2(const std::string &name,
         MinorCPU &cpu_,
         const BaseMinorCPUParams &params,
+        const Execute &execute_,
         Latch<ForwardLineData>::Output inp_,
         Latch<BranchData>::Output branchInp_,
         Latch<BranchData>::Input predictionOut_,

@@ -37,6 +37,7 @@
 
 #include "cpu/minor/fetch2.hh"
 
+#include <algorithm>
 #include <string>
 
 #include "arch/generic/decoder.hh"
@@ -48,7 +49,6 @@
 #include "debug/Branch.hh"
 #include "debug/Fetch.hh"
 #include "debug/MinorTrace.hh"
-#include "cpu/reg_class.hh"
 
 namespace gem5
 {
@@ -59,6 +59,7 @@ namespace minor
 Fetch2::Fetch2(const std::string &name,
     MinorCPU &cpu_,
     const BaseMinorCPUParams &params,
+    const Execute &execute_,
     Latch<ForwardLineData>::Output inp_,
     Latch<BranchData>::Output branchInp_,
     Latch<BranchData>::Input predictionOut_,
@@ -74,10 +75,39 @@ Fetch2::Fetch2(const std::string &name,
     outputWidth(params.decodeInputWidth),
     processMoreThanOneInput(params.fetch2CycleInput),
     branchPredictor(*params.branchPred),
+    ifaMode(params.ifa_mode),
+    ifaBufferSize(params.ifa_buffer_size),
+    ifaDecodeWidth(params.ifa_decode_width),
+    ifaLatency(params.ifa_latency),
+    ifaFlushOnStreamChange(params.ifa_flush_on_stream_change),
+    ifaDAUSource(params.ifa_dau_source),
+    ifaLoadLatency(params.ifa_load_latency),
+    ifaPassMemoryRefs(params.ifa_pass_memory_refs),
+    ifaHoistMemoryRefs(params.ifa_hoist_memory_refs),
+    ifaFillWhenBlocked(params.ifa_mode != 0 && params.ifa_fill_when_blocked),
+    ifaQueueAware(params.ifa_queue_aware),
+    decodeInputBufferSize(params.decodeInputBufferSize),
+    ifaIssueModel(params.ifa_issue_model),
+    ifaIssueLimit(params.executeIssueLimit),
+    ifaFUOpLat(Num_OpClasses, Cycles(0)),
+    ifaFURelLats(Num_OpClasses),
+    ifaOpFU(Num_OpClasses, -1),
+    ifaFUIssueLat(Num_OpClasses, Cycles(1)),
+    ifaModelLastIssue(0),
+    ifaModelNumAtLast(0),
+    ifaModelMemAtLast(false),
+    ifaModelFUFree(params.executeFuncUnits->funcUnits.size(), Cycles(0)),
+    execute(execute_),
+    ifaDispatchToIssue(params.fetch2ToDecodeForwardDelay +
+        params.decodeToExecuteForwardDelay),
+    ifaShadow(name + ".ifaShadow",
+        cpu_.threads[0]->getIsaPtr()->regClasses()),
+    ifaOpLatency(Num_OpClasses, Cycles(0)),
+    ifaSrcRelativeLatency(0),
+    ifaArrival(0),
+    ifaMaxDispatchedSeqNum(0),
     fetchInfo(params.numThreads),
-    threadPriority(0), stats(&cpu_),
-    ifaLatencyCounter(Cycles(0)),
-    isIFAStalled(false)
+    threadPriority(0), stats(&cpu_, params.ifa_buffer_size)
 {
     if (outputWidth < 1)
         fatal("%s: decodeInputWidth must be >= 1 (%d)\n", name, outputWidth);
@@ -93,6 +123,67 @@ Fetch2::Fetch2(const std::string &name,
             InputBuffer<ForwardLineData>(
                 name + ".inputBuffer" + std::to_string(tid), "lines",
                 params.fetch2InputBufferSize));
+    }
+
+    if (ifaMode > 2)
+        fatal("%s: ifa_mode must be 0, 1 or 2 (%d)\n", name, ifaMode);
+
+    if (ifaMode != 0) {
+        if (params.numThreads != 1) {
+            fatal("%s: the IFA only supports one thread (numThreads: %d)\n",
+                name, params.numThreads);
+        }
+
+        if (ifaBufferSize < 1) {
+            fatal("%s: ifa_buffer_size must be >= 1 (%d)\n", name,
+                ifaBufferSize);
+        }
+
+        if (ifaPassMemoryRefs && ifaHoistMemoryRefs) {
+            fatal("%s: ifa_pass_memory_refs and ifa_hoist_memory_refs"
+                " can't be used together\n", name);
+        }
+    }
+
+    /* Take the DAU's latency estimates from the Execute FU descriptions.
+     *  The FU used is the first that provides the OpClass, as in
+     *  Execute::issue */
+    const std::vector<MinorFU *> &fus = params.executeFuncUnits->funcUnits;
+
+    for (MinorFU *fu : fus) {
+        if (fu->opClasses->provides(IntAluOp)) {
+            if (!fu->timings.empty() &&
+                !fu->timings[0]->srcRegsRelativeLats.empty())
+            {
+                ifaSrcRelativeLatency =
+                    fu->timings[0]->srcRegsRelativeLats.back();
+            }
+            break;
+        }
+    }
+
+    for (int op_class = 0; op_class < Num_OpClasses; op_class++) {
+        for (int fu_index = 0; fu_index < fus.size(); fu_index++) {
+            MinorFU *fu = fus[fu_index];
+
+            if (fu->opClasses->provides(static_cast<OpClass>(op_class))) {
+                ifaFUOpLat[op_class] = fu->opLat + (fu->timings.empty() ?
+                    Cycles(0) : fu->timings[0]->extraAssumedLat);
+                if (!fu->timings.empty()) {
+                    ifaFURelLats[op_class] =
+                        fu->timings[0]->srcRegsRelativeLats;
+                }
+                ifaOpFU[op_class] = fu_index;
+                ifaFUIssueLat[op_class] = fu->issueLat;
+
+                Cycles latency = fu->opLat + (fu->timings.empty() ?
+                    Cycles(0) : fu->timings[0]->extraAssumedLat);
+
+                ifaOpLatency[op_class] = (latency > ifaSrcRelativeLatency ?
+                    Cycles(latency - ifaSrcRelativeLatency) : Cycles(0));
+                break;
+            }
+        }
     }
 }
 
@@ -239,64 +330,421 @@ Fetch2::predictBranch(MinorDynInstPtr inst, BranchData &branch)
     }
 }
 
-// --- HELPER FUNCTION ---
-// Função auxiliar robusta para detetar dependências (RAW, WAW, WAR)
-// VERSÃO COMPATÍVEL (Fixed Compilation Errors)
-bool hasDependency(MinorDynInstPtr older, MinorDynInstPtr younger)
+bool
+Fetch2::ifaIsBarrier(const MinorDynInstPtr &inst) const
 {
-    if (!older || !younger || !older->staticInst || !younger->staticInst)
-        return false;
-
-    // [FIX 1] Substituído isMemBarrier por isReadBarrier + isWriteBarrier
-    if (older->staticInst->isSerializing()   || younger->staticInst->isSerializing() ||
-        older->staticInst->isReadBarrier()   || younger->staticInst->isReadBarrier() ||
-        older->staticInst->isWriteBarrier()  || younger->staticInst->isWriteBarrier()) {
+    if (inst->isFault())
         return true;
-    }
 
-    // [1] RAW (Read After Write)
-    for (int i = 0; i < older->staticInst->numDestRegs(); i++) {
-        const RegId& dest = older->staticInst->destRegIdx(i);
-        
-        // [FIX 2] Removido isZeroReg() para compatibilidade.
-        // O código vai tratar escritas no R0 como dependência real. 
-        // É seguro e evita o erro de compilação.
-        // if (dest.isZeroReg()) continue; 
+    const StaticInstPtr &static_inst = inst->staticInst;
 
-        for (int j = 0; j < younger->staticInst->numSrcRegs(); j++) {
-            const RegId& src = younger->staticInst->srcRegIdx(j);
-            if (dest == src) return true; // Conflito encontrado!
-        }
-    }
+    /* Control instructions are barriers because Execute discards everything
+     *  it receives after a mispredicted branch.  Things which can fault and
+     *  aren't memory references, or which act on more state than their
+     *  register operands, must stay in order for exceptions to be precise */
+    return static_inst->isControl() ||
+        static_inst->isSyscall() ||
+        static_inst->isSerializing() ||
+        static_inst->isNonSpeculative() ||
+        static_inst->isSquashAfter() ||
+        static_inst->isReadBarrier() ||
+        static_inst->isWriteBarrier() ||
+        static_inst->isAtomic() ||
+        static_inst->isMacroop() ||
+        static_inst->isMicroop() ||
+        static_inst->isQuiesce() ||
+        static_inst->isHtmCmd() ||
+        static_inst->isInvalid();
+}
 
-    // [2] WAW (Write After Write)
-    for (int i = 0; i < older->staticInst->numDestRegs(); i++) {
-        const RegId& destOlder = older->staticInst->destRegIdx(i);
-        // if (destOlder.isZeroReg()) continue; // REMOVIDO
+/** Do the register operands of a (dests or srcs) and b (dests or srcs)
+ *  have a register in common?  Invalid registers (such as RISC-V's x0)
+ *  carry no dependencies */
+static bool
+ifaRegsOverlap(const StaticInstPtr &a, bool a_dests,
+    const StaticInstPtr &b, bool b_dests)
+{
+    int num_a = (a_dests ? a->numDestRegs() : a->numSrcRegs());
+    int num_b = (b_dests ? b->numDestRegs() : b->numSrcRegs());
 
-        for (int j = 0; j < younger->staticInst->numDestRegs(); j++) {
-            const RegId& destYounger = younger->staticInst->destRegIdx(j);
-            if (destOlder == destYounger) return true;
-        }
-    }
+    for (int i = 0; i < num_a; i++) {
+        const RegId &reg_a = (a_dests ? a->destRegIdx(i) : a->srcRegIdx(i));
 
-    // [3] WAR (Write After Read)
-    for (int i = 0; i < older->staticInst->numSrcRegs(); i++) {
-        const RegId& src = older->staticInst->srcRegIdx(i);
-        // if (src.isZeroReg()) continue; // REMOVIDO
+        if (reg_a.classValue() == InvalidRegClass)
+            continue;
 
-        for (int j = 0; j < younger->staticInst->numDestRegs(); j++) {
-            const RegId& dest = younger->staticInst->destRegIdx(j);
-            if (src == dest) return true;
+        for (int j = 0; j < num_b; j++) {
+            if (reg_a == (b_dests ? b->destRegIdx(j) : b->srcRegIdx(j)))
+                return true;
         }
     }
 
     return false;
 }
 
+bool
+Fetch2::ifaSourcesReady(const MinorDynInstPtr &inst)
+{
+    if (inst->isFault())
+        return true;
+
+    const StaticInstPtr &static_inst = inst->staticInst;
+    ThreadID tid = inst->id.threadId;
+    auto *isa = cpu.getContext(tid)->getIsaPtr();
+    /* inst can reach issue in Execute no earlier than this */
+    Cycles arrival = ifaArrival;
+
+    for (int i = 0; i < static_inst->numSrcRegs(); i++) {
+        RegId reg = static_inst->srcRegIdx(i).flatten(*isa);
+        Scoreboard::Index index;
+
+        if (!ifaShadow.findIndex(reg, index))
+            continue;
+
+        /* Producers dispatched by Fetch2, including those not yet in
+         *  Execute, with their estimated latency */
+        if (ifaDAUSource != enums::IFAScoreboard &&
+            ifaShadow.returnCycle[index] > arrival)
+        {
+            return false;
+        }
+
+        /* Producers in Execute.  A memory reference which hasn't completed
+         *  is waited for whatever the shadow estimate (it may have
+         *  missed in the cache) */
+        if (ifaDAUSource != enums::IFAShadow) {
+            Execute::IFARegState state = execute.ifaRegState(tid, reg);
+
+            if (state.memPending)
+                return false;
+
+            if (ifaDAUSource == enums::IFAScoreboard && state.pending &&
+                state.returnCycle > arrival + ifaSrcRelativeLatency)
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool
+Fetch2::ifaCanPass(const MinorDynInstPtr &inst,
+    const std::vector<MinorDynInstPtr> &skipped) const
+{
+    const StaticInstPtr &static_inst = inst->staticInst;
+
+    /* Barriers only leave in program order */
+    if (ifaIsBarrier(inst))
+        return false;
+
+    /* Memory references normally leave in program order too.  This keeps
+     *  the order of memory accesses and makes a faulting access precise:
+     *  nothing older is left undispatched behind it.  When hoisting, a
+     *  memory reference can pass the head if nothing younger than the
+     *  head has been dispatched: if it faults, restarting from the head
+     *  executes nothing twice */
+    if (static_inst->isMemRef()) {
+        if (!ifaHoistMemoryRefs ||
+            ifaMaxDispatchedSeqNum >= skipped.front()->id.fetchSeqNum)
+        {
+            return false;
+        }
+    }
+
+    /* If an older memory reference which inst passes faults after inst has
+     *  committed, inst will be executed again when the fault returns.  That
+     *  is only safe if it doesn't overwrite one of its own sources, and
+     *  still adds to the committed instruction count */
+    bool can_pass_memory_refs = ifaPassMemoryRefs &&
+        !ifaRegsOverlap(static_inst, true, static_inst, false);
+
+    for (const MinorDynInstPtr &older : skipped) {
+        const StaticInstPtr &older_inst = older->staticInst;
+
+        if (older_inst->isMemRef() &&
+            (!can_pass_memory_refs || static_inst->isMemRef()))
+        {
+            return false;
+        }
+
+        if (ifaRegsOverlap(older_inst, true, static_inst, false) || /* RAW */
+            ifaRegsOverlap(older_inst, false, static_inst, true) || /* WAR */
+            ifaRegsOverlap(older_inst, true, static_inst, true)) /* WAW */
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void
+Fetch2::ifaMarkupDispatch(const MinorDynInstPtr &inst)
+{
+    if (inst->isFault())
+        return;
+
+    const StaticInstPtr &static_inst = inst->staticInst;
+    auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+    Cycles ready = ifaArrival +
+        (static_inst->isMemRef() ? ifaLoadLatency :
+            ifaOpLatency[static_inst->opClass()]);
+
+    for (int i = 0; i < static_inst->numDestRegs(); i++) {
+        RegId reg = static_inst->destRegIdx(i).flatten(*isa);
+        Scoreboard::Index index;
+
+        if (ifaShadow.findIndex(reg, index))
+            ifaShadow.returnCycle[index] = ready;
+    }
+}
+
+Cycles
+Fetch2::ifaEstimateIssue(const MinorDynInstPtr &inst) const
+{
+    /* In order: not before the last dispatched instruction */
+    Cycles issue = std::max(ifaModelLastIssue, ifaArrival);
+
+    if (!inst->isFault()) {
+        const StaticInstPtr &static_inst = inst->staticInst;
+        OpClass op_class = static_inst->opClass();
+        const std::vector<Cycles> &rel_lats = ifaFURelLats[op_class];
+        auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+
+        /* As Scoreboard::canInstIssue: a source is available from its
+         *  returnCycle less the source's relative latency */
+        for (int i = 0; i < static_inst->numSrcRegs(); i++) {
+            RegId reg = static_inst->srcRegIdx(i).flatten(*isa);
+            Scoreboard::Index index;
+
+            if (!ifaShadow.findIndex(reg, index))
+                continue;
+
+            Cycles rel_lat = (rel_lats.empty() ? Cycles(0) :
+                rel_lats[std::min<size_t>(i, rel_lats.size() - 1)]);
+            Cycles ready = ifaShadow.returnCycle[index];
+
+            if (ready > issue + rel_lat)
+                issue = Cycles(ready - rel_lat);
+        }
+
+        int fu_index = ifaOpFU[op_class];
+        if (fu_index >= 0)
+            issue = std::max(issue, ifaModelFUFree[fu_index]);
+    }
+
+    /* Execute issues up to ifaIssueLimit instructions a cycle and stops
+     *  after a memory reference */
+    if (issue == ifaModelLastIssue &&
+        (ifaModelNumAtLast >= ifaIssueLimit || ifaModelMemAtLast))
+    {
+        issue = Cycles(issue + 1);
+    }
+
+    return issue;
+}
+
+void
+Fetch2::ifaModelDispatch(const MinorDynInstPtr &inst, Cycles issue_cycle)
+{
+    bool is_mem = !inst->isFault() && inst->staticInst->isMemRef();
+
+    if (issue_cycle > ifaModelLastIssue) {
+        ifaModelLastIssue = issue_cycle;
+        ifaModelNumAtLast = 1;
+        ifaModelMemAtLast = is_mem;
+    } else {
+        ifaModelNumAtLast++;
+        ifaModelMemAtLast = ifaModelMemAtLast || is_mem;
+    }
+
+    if (inst->isFault())
+        return;
+
+    const StaticInstPtr &static_inst = inst->staticInst;
+    OpClass op_class = static_inst->opClass();
+    auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+
+    for (int i = 0; i < static_inst->numDestRegs(); i++) {
+        RegId reg = static_inst->destRegIdx(i).flatten(*isa);
+        Scoreboard::Index index;
+
+        if (ifaShadow.findIndex(reg, index)) {
+            ifaShadow.returnCycle[index] =
+                Cycles(issue_cycle + ifaFUOpLat[op_class]);
+        }
+    }
+
+    int fu_index = ifaOpFU[op_class];
+    if (fu_index >= 0 && ifaFUIssueLat[op_class] > 1) {
+        ifaModelFUFree[fu_index] =
+            Cycles(issue_cycle + ifaFUIssueLat[op_class]);
+    }
+}
+
+void
+Fetch2::ifaDispatch(ForwardInstData &insts_out)
+{
+    const Cycles now = cpu.curCycle();
+    unsigned int output_index = 0;
+    bool passed_head = false;
+
+    auto dispatchable = [&](const IFAEntry &entry) {
+        return entry.dispatchableCycle <= now;
+    };
+
+    /* Move an entry to the output, returning the entry after it */
+    auto dispatch = [&](std::deque<IFAEntry>::iterator entry,
+        bool out_of_order)
+    {
+        MinorDynInstPtr inst = entry->inst;
+
+        if (output_index == 0)
+            insts_out.resize(outputWidth);
+        insts_out.insts[output_index] = inst;
+        output_index++;
+
+        if (ifaIssueModel)
+            ifaModelDispatch(inst, ifaEstimateIssue(inst));
+        else
+            ifaMarkupDispatch(inst);
+        ifaMaxDispatchedSeqNum = std::max(ifaMaxDispatchedSeqNum,
+            inst->id.fetchSeqNum);
+        stats.ifaDispatched++;
+        if (out_of_order) {
+            stats.ifaDispatchedOutOfOrder++;
+            passed_head = true;
+        }
+
+        DPRINTF(Fetch, "IFA dispatching%s inst: %s\n",
+            (out_of_order ? " out of order" : ""), *inst);
+
+        return ifaBuffer.erase(entry);
+    };
+
+    if (ifaBuffer.empty() || !dispatchable(ifaBuffer.front()))
+        return;
+
+    /* Instructions dispatched now reach issue after the latches and, if
+     *  asked, after the instructions already queued in Decode's and
+     *  Execute's input buffers (each holding one cycle's worth of
+     *  instructions) */
+    ifaArrival = now + ifaDispatchToIssue;
+    if (ifaQueueAware) {
+        ThreadID tid = ifaBuffer.front().inst->id.threadId;
+
+        ifaArrival += Cycles(decodeInputBufferSize -
+            nextStageReserve[tid].unreservedRemainingSpace() +
+            execute.ifaInputBufferOccupancy(tid));
+    }
+
+    bool head_blocked = (ifaIssueModel ?
+        ifaEstimateIssue(ifaBuffer.front().inst) >
+            Cycles(std::max(ifaModelLastIssue, ifaArrival) + 1) :
+        !ifaSourcesReady(ifaBuffer.front().inst));
+
+    if (head_blocked)
+        stats.ifaHeadBlockedCycles++;
+
+    if (ifaMode == 2 && ifaIssueModel) {
+        /* List scheduling: each slot gets the legal instruction which would
+         *  issue earliest, the oldest on a tie */
+        while (output_index < outputWidth && !ifaBuffer.empty()) {
+            std::vector<MinorDynInstPtr> older;
+            auto best = ifaBuffer.end();
+            Cycles best_issue(0);
+            MinorDynInstPtr best_passed_head = nullptr;
+            unsigned int best_num_passed = 0;
+
+            for (auto entry = ifaBuffer.begin();
+                entry != ifaBuffer.end() && dispatchable(*entry); entry++)
+            {
+                const MinorDynInstPtr &inst = entry->inst;
+
+                if (older.empty() || ifaCanPass(inst, older)) {
+                    Cycles issue = ifaEstimateIssue(inst);
+
+                    if (best == ifaBuffer.end() || issue < best_issue) {
+                        best = entry;
+                        best_issue = issue;
+                        best_passed_head =
+                            (older.empty() ? nullptr : older.front());
+                        best_num_passed = older.size();
+                    }
+                }
+
+                /* Nothing younger can pass a barrier */
+                if (ifaIsBarrier(inst))
+                    break;
+                older.push_back(inst);
+            }
+
+            if (best == ifaBuffer.end())
+                break;
+
+            const MinorDynInstPtr inst = best->inst;
+
+            if (best_num_passed != 0 && inst->staticInst->isMemRef()) {
+                /* A hoisted memory reference: a fault in it must restart
+                 *  from the oldest instruction it passed */
+                set(inst->ifaRestartPC, best_passed_head->pc);
+                stats.ifaHoisted++;
+            }
+            stats.ifaSkipped += best_num_passed;
+
+            dispatch(best, best_num_passed != 0);
+        }
+    } else if (ifaMode == 2) {
+        /* Older instructions which the scan has left in the FEB */
+        std::vector<MinorDynInstPtr> skipped;
+        auto entry = ifaBuffer.begin();
+
+        while (entry != ifaBuffer.end() && dispatchable(*entry) &&
+            output_index < outputWidth)
+        {
+            const MinorDynInstPtr inst = entry->inst;
+
+            if (ifaSourcesReady(inst) &&
+                (skipped.empty() || ifaCanPass(inst, skipped)))
+            {
+                if (!skipped.empty() && inst->staticInst->isMemRef()) {
+                    /* A hoisted memory reference: a fault in it must
+                     *  restart from the oldest instruction it passed */
+                    set(inst->ifaRestartPC, skipped.front()->pc);
+                    stats.ifaHoisted++;
+                }
+                entry = dispatch(entry, !skipped.empty());
+            } else if (ifaIsBarrier(inst)) {
+                /* Nothing younger can pass a barrier */
+                break;
+            } else {
+                DPRINTF(Fetch, "IFA skipping inst: %s\n", *inst);
+                skipped.push_back(inst);
+                stats.ifaSkipped++;
+                entry++;
+            }
+        }
+    }
+
+    /* Fill the rest of the output in program order.  This is all of
+     *  dispatch in mode 1 and, in mode 2, makes sure the IFA never sends
+     *  fewer instructions than in-order dispatch would */
+    while (output_index < outputWidth && !ifaBuffer.empty() &&
+        dispatchable(ifaBuffer.front()))
+    {
+        dispatch(ifaBuffer.begin(), false);
+    }
+
+    if (head_blocked && passed_head)
+        stats.ifaReorderCycles++;
+}
+
 void
 Fetch2::evaluate()
 {
+    /* Push input onto appropriate input buffer */
     if (!inp.outputWire->isBubble())
         inputBuffer[inp.outputWire->id.threadId].setTail(*inp.outputWire);
 
@@ -306,65 +754,127 @@ Fetch2::evaluate()
 
     assert(insts_out.isBubble());
 
+    /* React to branches from Execute to update local branch prediction
+     *  structures */
     updateBranchPrediction(branch_inp);
 
+    /* If a branch arrives, don't try and do anything about it.  Only
+     *  react to your own predictions */
     if (branch_inp.isStreamChange()) {
-        DPRINTF(Fetch, "Stream change dumping input\n");
+        DPRINTF(Fetch, "Dumping all input as a stream changing branch"
+            " has arrived\n");
         dumpAllInput(branch_inp.threadId);
-
         fetchInfo[branch_inp.threadId].havePC = false;
+
+        /* Instructions in the FEB from the old stream would only be
+         *  discarded by Execute */
+        if (ifaMode != 0 && ifaFlushOnStreamChange) {
+            auto old_stream = std::remove_if(ifaBuffer.begin(),
+                ifaBuffer.end(), [&](const IFAEntry &entry) {
+                    return entry.inst->id.streamSeqNum !=
+                        branch_inp.newStreamSeqNum;
+                });
+            unsigned int num_flushed = ifaBuffer.end() - old_stream;
+
+            if (num_flushed != 0) {
+                DPRINTF(Fetch, "IFA discarding %d FEB entries\n",
+                    num_flushed);
+                stats.ifaFlushes++;
+                stats.ifaFlushedInsts += num_flushed;
+                ifaBuffer.erase(old_stream, ifaBuffer.end());
+            }
+        }
     }
 
     assert(insts_out.isBubble());
-
-    // Cleanup instructions from wrong stream (STANDARD)
+    /* Even when blocked, clear out input lines with the wrong
+     *  prediction sequence number */
     for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
         Fetch2ThreadInfo &thread = fetchInfo[tid];
+
         thread.blocked = !nextStageReserve[tid].canReserve();
+
         const ForwardLineData *line_in = getInput(tid);
 
         while (line_in &&
             thread.expectedStreamSeqNum == line_in->id.streamSeqNum &&
             thread.predictionSeqNum != line_in->id.predictionSeqNum)
         {
+            DPRINTF(Fetch, "Discarding line %s"
+                " due to predictionSeqNum mismatch (expected: %d)\n",
+                line_in->id, thread.predictionSeqNum);
+
             popInput(tid);
             fetchInfo[tid].havePC = false;
-            if (processMoreThanOneInput) line_in = getInput(tid);
-            else line_in = NULL;
+
+            if (processMoreThanOneInput) {
+                DPRINTF(Fetch, "Wrapping\n");
+                line_in = getInput(tid);
+            } else {
+                line_in = NULL;
+            }
         }
     }
 
     ThreadID tid = getScheduledThread();
     DPRINTF(Fetch, "Scheduled Thread: %d\n", tid);
 
+    assert(insts_out.isBubble());
     if (tid != InvalidThreadID) {
         Fetch2ThreadInfo &fetch_info = fetchInfo[tid];
+
         const ForwardLineData *line_in = getInput(tid);
+
         unsigned int output_index = 0;
 
-        // --- DECODE LOOP ---
+        /* Number of instructions put into the FEB this cycle */
+        unsigned int ifa_num_decoded = 0;
+
+        /* Pack instructions into the output (or, with the IFA, the FEB)
+         * while we can.  This may involve using more than one input line.
+         * Note that lineWidth will be 0 for faulting lines */
         while (line_in &&
             (line_in->isFault() ||
                 fetch_info.inputIndex < line_in->lineWidth) && /* More input */
-            output_index < outputWidth && /* More output to fill */
+            (ifaMode == 0 ?
+                output_index < outputWidth : /* More output to fill */
+                (ifaBuffer.size() < ifaBufferSize && /* FEB space */
+                    (ifaDecodeWidth == 0 ||
+                        ifa_num_decoded < ifaDecodeWidth))) &&
             prediction.isBubble() /* No predicted branch */)
         {
-            // Backpressure do IFA
-            if (cpu.enableIFA && ifaBuffer.size() >= 16) break; 
-
             ThreadContext *thread = cpu.getContext(line_in->id.threadId);
             InstDecoder *decoder = thread->getDecoderPtr();
-            bool discard_line = fetch_info.expectedStreamSeqNum == line_in->id.streamSeqNum &&
-                                fetch_info.predictionSeqNum != line_in->id.predictionSeqNum;
-            bool set_pc = fetch_info.lastStreamSeqNum != line_in->id.streamSeqNum;
+
+            /* Discard line due to prediction sequence number being wrong but
+             * without the streamSeqNum number having changed */
+            bool discard_line =
+                fetch_info.expectedStreamSeqNum == line_in->id.streamSeqNum &&
+                fetch_info.predictionSeqNum != line_in->id.predictionSeqNum;
+
+            /* Set the PC if the stream changes.  Setting havePC to false in
+             *  a previous cycle handles all other change of flow of control
+             *  issues */
+            bool set_pc =
+                fetch_info.lastStreamSeqNum != line_in->id.streamSeqNum;
 
             if (!discard_line && (!fetch_info.havePC || set_pc)) {
-                fetch_info.inputIndex = (line_in->pc->instAddr() & decoder->pcMask()) - line_in->lineBaseAddr;
+                /* Set the inputIndex to be the MachInst-aligned offset
+                 *  from lineBaseAddr of the new PC value */
+                fetch_info.inputIndex =
+                    (line_in->pc->instAddr() & decoder->pcMask()) -
+                    line_in->lineBaseAddr;
+                DPRINTF(Fetch, "Setting new PC value: %s inputIndex: 0x%x"
+                    " lineBaseAddr: 0x%x lineWidth: 0x%x\n",
+                    *line_in->pc, fetch_info.inputIndex, line_in->lineBaseAddr,
+                    line_in->lineWidth);
                 set(fetch_info.pc, line_in->pc);
                 fetch_info.havePC = true;
                 decoder->reset();
             }
 
+            /* The generated instruction.  Leave as NULL if no instruction
+             *  is to be packed into the output */
             MinorDynInstPtr dyn_inst = NULL;
 
             if (discard_line) {
@@ -498,19 +1008,21 @@ Fetch2::evaluate()
             }
 
             if (dyn_inst) {
+                /* Step to next sequence number */
                 fetch_info.fetchSeqNum++;
 
-                // === PONTO DE DECISÃO ===
-                if (cpu.enableIFA && !branch_inp.isStreamChange()) {
-                    DPRINTF(Fetch, "IFA DEBUG: Pushing inst to buffer: %s\n", *dyn_inst);
-                    // CAMINHO IFA: Rouba a instrução para o buffer
-                    ifaBuffer.push_back(dyn_inst);
+                if (ifaMode != 0) {
+                    /* The IFA dispatches from the FEB below */
+                    ifaBuffer.push_back(
+                        IFAEntry{dyn_inst, cpu.curCycle() + ifaLatency});
+                    ifa_num_decoded++;
                 } else {
+                    /* Correctly size the output before writing */
                     if (output_index == 0) {
                         insts_out.resize(outputWidth);
                     }
-
-                    /* Pack the generated dynamic instruction into the output */
+                    /* Pack the generated dynamic instruction into the
+                     *  output */
                     insts_out.insts[output_index] = dyn_inst;
                     output_index++;
                 }
@@ -523,6 +1035,8 @@ Fetch2::evaluate()
                 }
             }
 
+            /* Remember the streamSeqNum of this line so we can tell when
+             *  we change stream */
             fetch_info.lastStreamSeqNum = line_in->id.streamSeqNum;
 
             /* Asked to discard line or there was a branch or fault */
@@ -547,137 +1061,30 @@ Fetch2::evaluate()
                 popInput(tid);
                 line_in = NULL;
             }
+
             if (!line_in && processMoreThanOneInput) {
                 DPRINTF(Fetch, "Wrapping\n");
                 line_in = getInput(tid);
             }
         }
 
-        // =========================================================
-        //                        LÓGICA DO IFA
-        // =========================================================
-        if (cpu.enableIFA) {
+        if (ifaMode != 0) {
+            if (ifaBuffer.size() >= ifaBufferSize && getInput(tid))
+                stats.ifaBufferFullCycles++;
 
-            if (insts_out.width() < outputWidth) {
-                insts_out.resize(outputWidth);
-            }
-
-            // Higienização (Bubbles) - Prevenção de Crash
-            for (unsigned int i = 0; i < outputWidth; i++) {
-                if (!insts_out.insts[i]) insts_out.insts[i] = MinorDynInst::bubble();
-            }
-
-            if (!ifaBuffer.empty()) {
-                std::vector<MinorDynInstPtr> skipped_insts;
-                bool control_barrier = false;
-
-                // Loop de Despacho Otimizado
-                for (unsigned int slot = 0; slot < outputWidth; slot++) {
-                    if (!insts_out.insts[slot]->isBubble()) continue;
-
-                    auto it = ifaBuffer.begin();
-                    int search_depth = 0;
-                    const int MAX_SEARCH_DEPTH = 16;
-
-                    while (it != ifaBuffer.end()) {
-                        if (search_depth >= MAX_SEARCH_DEPTH) break;
-                        search_depth++;
-
-                        MinorDynInstPtr candidate = *it;
-
-                        if (!candidate || candidate->isBubble()) {
-                            it = ifaBuffer.erase(it); continue;
-                        }
-                        if (candidate->isFault()) {
-                            if (it == ifaBuffer.begin() && slot == 0) {
-                                insts_out.insts[slot] = candidate;
-                                ifaBuffer.erase(it);
-                            }
-                            goto finish_dispatch;
-                        }
-                        if (!candidate->staticInst) { 
-                            it = ifaBuffer.erase(it); continue;
-                        }
-
-                        // --- VERIFICAÇÃO DE CONFLITOS OTIMIZADA ---
-                        bool conflict = false;
-
-                        // [REGRA 1: HIERARQUIA & SEGURANÇA ARM]
-                        // Micro-ops e Macros devem sair em ordem (FIFO) para evitar o 0x2b8.
-                        if (candidate->staticInst->isControl() || 
-                            candidate->staticInst->isSyscall() ||
-                            candidate->staticInst->isMacroop() ||
-                            candidate->staticInst->isMicroop() || 
-                            candidate->staticInst->isSerializing()) 
-                        {
-                            // Se não for o primeiro da fila, ou se pulámos alguém, espera.
-                            if (it != ifaBuffer.begin() || !skipped_insts.empty()) {
-                                conflict = true; 
-                            }
-                        }
-
-                        // [REGRA 2: DEPENDÊNCIA APENAS COM QUEM FICOU PARA TRÁS]
-                        // Nota: REMOVEMOS a verificação contra 'insts_out'. 
-                        // É seguro despachar [A, B] juntos mesmo que B dependa de A,
-                        // pois o MinorCPU executa Slot 0 antes de Slot 1.
-                        if (!conflict) {
-                            for (auto& blocker : skipped_insts) {
-                                if (!blocker || !blocker->staticInst) continue;
-                                
-                                // Se o candidato depende de alguém que pulámos, não pode passar.
-                                if (hasDependency(blocker, candidate) || hasDependency(candidate, blocker)) {
-                                    conflict = true; break;
-                                }
-                                
-                                // Barreiras de Memória e Controlo
-                                if (blocker->staticInst->isMemRef() && candidate->staticInst->isMemRef()) {
-                                    conflict = true; break;
-                                }
-                                if (blocker->staticInst->isControl() || blocker->staticInst->isMacroop() || 
-                                    blocker->staticInst->isMicroop() || blocker->staticInst->isSerializing()) {
-                                    conflict = true; break;
-                                }
-                            }
-                        }
-
-                        if (!conflict) {
-                            // SUCESSO: Despacha
-                            insts_out.insts[slot] = candidate;
-                            it = ifaBuffer.erase(it);
-
-                            // Stop-After-Dispatch para instruções críticas
-                            if (candidate->staticInst->isControl() || 
-                                candidate->staticInst->isSerializing() ||
-                                candidate->staticInst->isSyscall()) {
-                                goto finish_dispatch;
-                            }
-                            break; 
-                        } else {
-                            // FALHA: Adiciona aos pulados
-                            skipped_insts.push_back(candidate);
-                            if (skipped_insts.size() >= 4) break; 
-                            ++it;
-                        }
-                    }
-                }
-                finish_dispatch:;
-                
-                // Anti-Deadlock (Só age se não despachamos nada e o primeiro não é Fault)
-                if (!ifaBuffer.empty() && insts_out.insts[0]->isBubble()) {
-                     if (!ifaBuffer.front()->isFault()) {
-                        insts_out.insts[0] = ifaBuffer.front();
-                        ifaBuffer.pop_front();
-                     }
-                }
-            }
+            /* With ifaFillWhenBlocked, this thread may only have been
+             *  scheduled to fill the FEB */
+            if (!fetch_info.blocked)
+                ifaDispatch(insts_out);
         }
-    }
 
+        /* The rest of the output (if any) should already have been packed
+         *  with bubble instructions by insts_out's initialisation */
+    }
     if (tid == InvalidThreadID) {
         assert(insts_out.isBubble());
     }
-
-    // --- FINALIZAÇÃO PADRÃO ---
+    /** Reserve a slot in the next stage and output data */
     *predictionOut.inputWire = prediction;
 
     /* If we generated output, reserve space for the result in the next stage
@@ -691,35 +1098,20 @@ Fetch2::evaluate()
 
     /* If we still have input to process and somewhere to put it,
      *  mark stage as active */
-    for (ThreadID i = 0; i < cpu.numThreads; i++) {
-        bool has_input = (getInput(i) != NULL);
-        bool has_ifa_work = (cpu.enableIFA && !ifaBuffer.empty());
-
-        if ((has_input || has_ifa_work) && nextStageReserve[i].canReserve()) {
+    for (ThreadID i = 0; i < cpu.numThreads; i++)
+    {
+        if (((getInput(i) || !ifaBuffer.empty()) &&
+                nextStageReserve[i].canReserve()) ||
+            (ifaFillWhenBlocked && getInput(i) &&
+                ifaBuffer.size() < ifaBufferSize))
+        {
             cpu.activityRecorder->activateStage(Pipeline::Fetch2StageId);
             break;
         }
     }
 
-    // =================================================================
-    // [FIX EXIT] DETECÇÃO DE TÉRMINO
-    // =================================================================
-    // Se o buffer do IFA está vazio E o Fetch1 parou de mandar dados,
-    // significa que o programa acabou. Forçamos a desativação explícita
-    // para garantir que o gem5 entenda que este estágio terminou.
-    // =================================================================
-    if (cpu.enableIFA && ifaBuffer.empty() && inp.outputWire->isBubble()) {
-        bool all_empty = true;
-        for (ThreadID i = 0; i < cpu.numThreads; i++) {
-             if (getInput(i) != NULL) { all_empty = false; break; }
-        }
-        
-        if (all_empty) {
-            // Desliga o estágio explicitamente. Isso ajuda o simulador a sair.
-            cpu.activityRecorder->deactivateStage(Pipeline::Fetch2StageId);
-        }
-    }
-    // =================================================================
+    if (ifaMode != 0)
+        stats.ifaOccupancy.sample(ifaBuffer.size());
 
     /* Make sure the input (if any left) is pushed */
     if (!inp.outputWire->isBubble())
@@ -747,12 +1139,11 @@ Fetch2::getScheduledThread()
     }
 
     for (auto tid : priority_list) {
-        // CORREÇÃO: Verifica se há Input OU trabalho no IFA
-        bool has_input = (getInput(tid) != NULL);
-        bool has_ifa_work = (cpu.enableIFA && !ifaBuffer.empty());
-
-        // Se tiver qualquer trabalho e não estiver bloqueado, agenda!
-        if ((has_input || has_ifa_work) && !fetchInfo[tid].blocked) {
+        if (((getInput(tid) || !ifaBuffer.empty()) &&
+                !fetchInfo[tid].blocked) ||
+            (ifaFillWhenBlocked && getInput(tid) &&
+                ifaBuffer.size() < ifaBufferSize))
+        {
             threadPriority = tid;
             return tid;
         }
@@ -769,11 +1160,13 @@ Fetch2::isDrained()
             return false;
     }
 
-    return (*inp.outputWire).isBubble() &&
+    return ifaBuffer.empty() &&
+           (*inp.outputWire).isBubble() &&
            (*predictionOut.inputWire).isBubble();
 }
 
-Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu)
+Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu,
+    unsigned int ifa_buffer_size)
     : statistics::Group(cpu, "fetch2"),
       ADD_STAT(totalInstructions, statistics::units::Count::get(),
                "Total number of instructions successfully decoded"),
@@ -788,7 +1181,33 @@ Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu)
       ADD_STAT(storeInstructions, statistics::units::Count::get(),
                "Number of memory store instructions successfully decoded"),
       ADD_STAT(amoInstructions, statistics::units::Count::get(),
-               "Number of memory atomic instructions successfully decoded")
+               "Number of memory atomic instructions successfully decoded"),
+      ADD_STAT(ifaDispatched, statistics::units::Count::get(),
+               "Number of instructions dispatched from the IFA FEB"),
+      ADD_STAT(ifaDispatchedOutOfOrder, statistics::units::Count::get(),
+               "Number of instructions dispatched from the IFA FEB while an"
+               " older instruction stayed in it"),
+      ADD_STAT(ifaHoisted, statistics::units::Count::get(),
+               "Number of memory references dispatched from the IFA FEB"
+               " before older instructions"),
+      ADD_STAT(ifaSkipped, statistics::units::Count::get(),
+               "Number of times the IFA dispatch scan left an instruction in"
+               " the FEB to look at younger ones"),
+      ADD_STAT(ifaHeadBlockedCycles, statistics::units::Cycle::get(),
+               "Number of cycles in which the oldest FEB instruction could"
+               " be dispatched but the DAU found it not ready"),
+      ADD_STAT(ifaReorderCycles, statistics::units::Cycle::get(),
+               "Number of cycles in which the oldest FEB instruction was not"
+               " ready and a younger one was dispatched before it"),
+      ADD_STAT(ifaBufferFullCycles, statistics::units::Cycle::get(),
+               "Number of cycles in which input could not be decoded"
+               " because the IFA FEB was full"),
+      ADD_STAT(ifaFlushes, statistics::units::Count::get(),
+               "Number of stream changes which discarded IFA FEB entries"),
+      ADD_STAT(ifaFlushedInsts, statistics::units::Count::get(),
+               "Number of IFA FEB entries discarded on stream changes"),
+      ADD_STAT(ifaOccupancy, statistics::units::Count::get(),
+               "Number of IFA FEB entries at the end of each cycle")
 {
     totalInstructions.flags(statistics::total);
     intInstructions.flags(statistics::total);
@@ -797,6 +1216,8 @@ Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu)
     loadInstructions.flags(statistics::total);
     storeInstructions.flags(statistics::total);
     amoInstructions.flags(statistics::total);
+
+    ifaOccupancy.init(0, ifa_buffer_size, 1);
 }
 
 void
@@ -817,4 +1238,3 @@ Fetch2::minorTrace() const
 
 } // namespace minor
 } // namespace gem5
-

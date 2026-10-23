@@ -124,6 +124,23 @@ class Execute : public Named
     /** Scoreboard of instruction dependencies */
     std::vector<Scoreboard> scoreboard;
 
+    /** Copy of scoreboard taken at the start of each cycle for the IFA in
+     *  Fetch2.  Execute is evaluated before Fetch2 in the same cycle, so
+     *  reading scoreboard directly would give Fetch2 the effect of this
+     *  cycle's issue and commit with no delay */
+    std::vector<Scoreboard> ifaScoreboardSnapshot;
+
+    /** Keep ifaScoreboardSnapshot up to date */
+    bool ifaNeedsScoreboard;
+
+    /** Number of input buffer slots (occupied or reserved) at the start of
+     *  this cycle, and at the end of this cycle, for the IFA */
+    std::vector<unsigned int> ifaInputOccupancy;
+    std::vector<unsigned int> ifaNextInputOccupancy;
+
+    /** Capacity of each input buffer */
+    unsigned int inputBufferSize;
+
     /** The execution functional units */
     std::vector<FUPipeline *> funcUnits;
 
@@ -212,6 +229,10 @@ class Execute : public Named
 
   protected:
     friend std::ostream &operator <<(std::ostream &os, DrainState state);
+
+    /** If the IFA dispatched inst before older instructions, make a fault
+     *  in inst restart execution from the oldest of them */
+    void ifaPrepareFault(MinorDynInstPtr inst, ThreadContext *thread);
 
     /** Get a piece of data to work on from the inputBuffer, or 0 if there
      *  is no data. */
@@ -347,6 +368,33 @@ class Execute : public Named
     /** Pass on input/buffer data to the output if you can */
     void evaluate();
 
+    /** State of a register in the scoreboard, as seen by the IFA */
+    struct IFARegState
+    {
+        /** An in-flight instruction will write the register */
+        bool pending = false;
+
+        /** The most recent writer is a memory reference which has not
+         *  completed, so its result time can't be predicted */
+        bool memPending = false;
+
+        /** Scoreboard's estimate of when the result will be available
+         *  (see Scoreboard::returnCycle) */
+        Cycles returnCycle = Cycles(0);
+    };
+
+    /** The state of a (flattened) register in the scoreboard at the start
+     *  of the current cycle, for the IFA's dependency analysis in Fetch2 */
+    IFARegState ifaRegState(ThreadID thread_id, const RegId &reg) const;
+
+    /** Number of input buffer slots, occupied or reserved by instructions
+     *  on their way from Decode, at the start of the current cycle */
+    unsigned int
+    ifaInputBufferOccupancy(ThreadID thread_id) const
+    {
+        return ifaInputOccupancy[thread_id];
+    }
+
     void minorTrace() const;
 
     /** After thread suspension, has Execute been drained of in-flight
@@ -357,10 +405,26 @@ class Execute : public Named
     unsigned int drain();
     void drainResume();
 
+    /** Why issue stopped in a cycle */
+    enum IssueStop
+    {
+        IssueStopFull, /* Issued executeIssueLimit instructions */
+        IssueStopNoInput, /* No (more) instructions to issue */
+        IssueStopOperands, /* Next instruction's sources not ready */
+        IssueStopFU, /* No capable FU could accept the next instruction */
+        IssueStopMemLimit, /* executeMemoryIssueLimit reached */
+        IssueStopOther,
+        NumIssueStop
+    };
+
+    /** Why the last call to issue stopped */
+    IssueStop issueStop;
+
     struct IssueStats : public statistics::Group
     {
         IssueStats(MinorCPU *cpu);
         statistics::Vector2d issuedInstType;
+        statistics::Vector issueStopCycles;
     } issueStats;
 };
 

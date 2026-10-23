@@ -191,6 +191,12 @@ class MinorDynInst : public RefCounted
     /** Predicted branch target */
     std::unique_ptr<PCStateBase> predictedTarget;
 
+    /** Set by the IFA in Fetch2 on a memory reference which it dispatched
+     *  before older instructions.  If the reference faults, execution
+     *  restarts from this PC (the oldest of those instructions) so that the
+     *  fault is precise */
+    std::unique_ptr<PCStateBase> ifaRestartPC;
+
     /** Fields only set during execution */
 
     /** FU this instruction is issued to */

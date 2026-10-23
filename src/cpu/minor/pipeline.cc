@@ -72,7 +72,7 @@ Pipeline::Pipeline(MinorCPU &cpu_, const BaseMinorCPUParams &params) :
         dToE.output(), eToF1.input()),
     decode(cpu.name() + ".decode", cpu, params,
         f2ToD.output(), dToE.input(), execute.inputBuffer),
-    fetch2(cpu.name() + ".fetch2", cpu, params,
+    fetch2(cpu.name() + ".fetch2", cpu, params, execute,
         f1ToF2.output(), eToF1.output(), f2ToF1.input(), f2ToD.input(),
         decode.inputBuffer),
     fetch1(cpu.name() + ".fetch1", cpu, params,
