@@ -1,0 +1,1535 @@
+--- a/src/cpu/minor/BaseMinorCPU.py
++++ b/src/cpu/minor/BaseMinorCPU.py
+@@ -298,11 +298,75 @@
+     vals = ["SingleThreaded", "RoundRobin", "Random"]
+ 
+ 
++class MinorIFADAUSource(Enum):
++    """Where the IFA's dependency analysis unit (DAU) looks for producers
++    which are still in flight: the shadow scoreboard kept in Fetch2,
++    Execute's scoreboard (as it was at the start of the cycle), or both"""
++
++    vals = ["IFAShadow", "IFAScoreboard", "IFAHybrid"]
++
++
+ class BaseMinorCPU(BaseCPU):
+     type = "BaseMinorCPU"
+     cxx_header = "cpu/minor/cpu.hh"
+     cxx_class = "gem5::MinorCPU"
+ 
++    ifa_mode = Param.Unsigned(
++        0,
++        "Instruction Flow Amplifier (IFA) in Fetch2: 0 = off (baseline"
++        " MinorCPU), 1 = front-end buffer (FEB) with in-order dispatch,"
++        " 2 = FEB with out-of-order dispatch of the instructions the"
++        " dependency analysis unit finds ready",
++    )
++    ifa_buffer_size = Param.Unsigned(16, "Number of IFA FEB entries")
++    ifa_decode_width = Param.Unsigned(
++        0,
++        "Maximum number of instructions decoded into the IFA FEB each cycle"
++        " (0 means no limit other than FEB space and available input)",
++    )
++    ifa_latency = Param.Cycles(
++        0,
++        "Cycles an instruction spends in the IFA FEB before it can be"
++        " dispatched (0 means in the cycle it is decoded)",
++    )
++    ifa_flush_on_stream_change = Param.Bool(
++        True,
++        "Discard IFA FEB entries from the old stream when Execute changes"
++        " stream",
++    )
++    ifa_dau_source = Param.MinorIFADAUSource(
++        "IFAHybrid",
++        "Where the IFA DAU finds in-flight producers",
++    )
++    ifa_load_latency = Param.Cycles(
++        4, "Load-to-use latency assumed by the IFA shadow scoreboard"
++    )
++    ifa_issue_model = Param.Bool(
++        True,
++        "Choose the IFA dispatch order with a model of Execute's in-order"
++        " issue (the instruction which would issue earliest goes first)"
++        " instead of oldest-ready-first",
++    )
++    ifa_hoist_memory_refs = Param.Bool(
++        False,
++        "Let the IFA dispatch memory references before older instructions"
++        " they don't depend on (faults restart from the oldest of them)",
++    )
++    ifa_fill_when_blocked = Param.Bool(
++        True, "Keep decoding into the IFA FEB while Decode is full"
++    )
++    ifa_queue_aware = Param.Bool(
++        False,
++        "Count the instructions queued in Decode and Execute when the IFA"
++        " DAU estimates when an instruction will reach issue",
++    )
++    ifa_pass_memory_refs = Param.Bool(
++        False,
++        "Let the IFA dispatch instructions which can be safely executed"
++        " again before older memory references.  If the memory reference"
++        " faults, they are executed (and committed) again",
++    )
++
+     @classmethod
+     def memory_mode(cls):
+         return "timing"
+--- a/src/cpu/minor/SConscript
++++ b/src/cpu/minor/SConscript
+@@ -44,7 +44,7 @@
+     SimObject('BaseMinorCPU.py', sim_objects=[
+         'MinorOpClass', 'MinorOpClassSet', 'MinorFUTiming', 'MinorFU',
+         'MinorFUPool', 'BaseMinorCPU'],
+-        enums=['ThreadPolicy'])
++        enums=['ThreadPolicy', 'MinorIFADAUSource'])
+ 
+     Source('activity.cc')
+     Source('cpu.cc')
+--- a/src/cpu/minor/dyn_inst.hh
++++ b/src/cpu/minor/dyn_inst.hh
+@@ -191,6 +191,12 @@
+     /** Predicted branch target */
+     std::unique_ptr<PCStateBase> predictedTarget;
+ 
++    /** Set by the IFA in Fetch2 on a memory reference which it dispatched
++     *  before older instructions.  If the reference faults, execution
++     *  restarts from this PC (the oldest of those instructions) so that the
++     *  fault is precise */
++    std::unique_ptr<PCStateBase> ifaRestartPC;
++
+     /** Fields only set during execution */
+ 
+     /** FU this instruction is issued to */
+--- a/src/cpu/minor/fetch2.hh
++++ b/src/cpu/minor/fetch2.hh
+@@ -45,13 +45,17 @@
+ #ifndef __CPU_MINOR_FETCH2_HH__
+ #define __CPU_MINOR_FETCH2_HH__
+ 
++#include <deque>
+ #include <vector>
+ 
+ #include "base/named.hh"
+ #include "cpu/minor/buffers.hh"
+ #include "cpu/minor/cpu.hh"
++#include "cpu/minor/execute.hh"
+ #include "cpu/minor/pipe_data.hh"
++#include "cpu/minor/scoreboard.hh"
+ #include "cpu/pred/bpred_unit.hh"
++#include "enums/MinorIFADAUSource.hh"
+ #include "params/BaseMinorCPU.hh"
+ 
+ namespace gem5
+@@ -94,6 +98,126 @@
+     /** Branch predictor passed from Python configuration */
+     branch_prediction::BPredUnit &branchPredictor;
+ 
++    /** Instruction Flow Amplifier (IFA) mode.  0: baseline Fetch2 (IFA
++     *  off).  1: decoded instructions go through the front-end buffer
++     *  (FEB) and leave it in program order.  2: the dispatch unit (DU)
++     *  sends the oldest instructions the dependency analysis unit (DAU)
++     *  finds ready, which may skip a blocked head */
++    const unsigned int ifaMode;
++
++    /** Number of FEB entries */
++    const unsigned int ifaBufferSize;
++
++    /** Maximum number of instructions decoded into the FEB each cycle.
++     *  0 means no limit other than FEB space and available input */
++    const unsigned int ifaDecodeWidth;
++
++    /** Cycles an instruction spends in the FEB before it can be
++     *  dispatched.  0 allows dispatch in the cycle it is decoded */
++    const Cycles ifaLatency;
++
++    /** Discard FEB entries from the old stream when Execute changes
++     *  stream.  If false, they are dispatched and dropped by Execute */
++    const bool ifaFlushOnStreamChange;
++
++    /** Where the DAU finds producers which are still in flight */
++    const enums::MinorIFADAUSource ifaDAUSource;
++
++    /** Load-to-use latency assumed by the shadow scoreboard */
++    const Cycles ifaLoadLatency;
++
++    /** Allow instructions which can be executed again with the same result
++     *  to pass older memory references.  If such a memory reference
++     *  faults (for example, a stack page fault in SE mode), the passing
++     *  instructions are executed and committed again after the fault */
++    const bool ifaPassMemoryRefs;
++
++    /** Allow memory references to be dispatched before older (non memory)
++     *  instructions they don't depend on, so that they start earlier.
++     *  Only the first instruction to pass the head may be a memory
++     *  reference, and if it faults, Execute restarts from the head
++     *  (MinorDynInst::ifaRestartPC), keeping faults precise */
++    const bool ifaHoistMemoryRefs;
++
++    /** Keep decoding into the FEB while Decode can't accept instructions */
++    const bool ifaFillWhenBlocked;
++
++    /** Include the instructions queued between Fetch2 and issue in the
++     *  DAU's estimate of when an instruction will reach issue */
++    const bool ifaQueueAware;
++
++    /** Capacity of Decode's input buffer */
++    const unsigned int decodeInputBufferSize;
++
++    /** Choose what to dispatch with a model of Execute's in-order issue:
++     *  the instruction which would issue earliest goes first, so a younger
++     *  instruction only passes the head if it would issue before it.  If
++     *  false, the oldest ready instruction goes first */
++    const bool ifaIssueModel;
++
++    /** Execute's executeIssueLimit */
++    const unsigned int ifaIssueLimit;
++
++    /** Issue model: by OpClass, as Execute's FUs see it: the latency
++     *  added to the issue cycle to give the scoreboard's returnCycle, the
++     *  source relative latencies, the FU used and its issue latency */
++    std::vector<Cycles> ifaFUOpLat;
++    std::vector<std::vector<Cycles>> ifaFURelLats;
++    std::vector<int> ifaOpFU;
++    std::vector<Cycles> ifaFUIssueLat;
++
++    /** Issue model state: the estimated issue cycle of the last dispatched
++     *  instruction, the number issued in that cycle, whether one of them
++     *  was a memory reference (which ends Execute's issue for the cycle)
++     *  and, by FU, the first cycle it can accept an instruction */
++    Cycles ifaModelLastIssue;
++    unsigned int ifaModelNumAtLast;
++    bool ifaModelMemAtLast;
++    std::vector<Cycles> ifaModelFUFree;
++
++    /** Execute, whose scoreboard the DAU reads */
++    const Execute &execute;
++
++    /** Earliest number of cycles between an instruction leaving Fetch2
++     *  and it reaching issue in Execute */
++    const Cycles ifaDispatchToIssue;
++
++    /** An FEB entry */
++    struct IFAEntry
++    {
++        MinorDynInstPtr inst;
++
++        /** Cycle at which the entry can first be dispatched */
++        Cycles dispatchableCycle;
++    };
++
++    /** The FEB, oldest instruction first.  Entries leave it when they are
++     *  dispatched, so the front is always the oldest undispatched
++     *  instruction (the head) */
++    std::deque<IFAEntry> ifaBuffer;
++
++    /** Shadow scoreboard.  Only its register indexing and returnCycle are
++     *  used: returnCycle holds, for each register, the estimated cycle
++     *  from which an instruction can issue in Execute after reading the
++     *  value of the last dispatched instruction writing that register */
++    Scoreboard ifaShadow;
++
++    /** Estimated cycles between a producer and a consumer issuing, by the
++     *  producer's OpClass.  Taken from the Execute FU descriptions,
++     *  except for memory operations, which use ifaLoadLatency */
++    std::vector<Cycles> ifaOpLatency;
++
++    /** Relative latency at which an integer consumer reads its sources,
++     *  used when comparing against Execute's own returnCycle */
++    Cycles ifaSrcRelativeLatency;
++
++    /** Estimated cycle at which instructions dispatched in this cycle reach
++     *  issue in Execute */
++    Cycles ifaArrival;
++
++    /** Youngest (largest fetchSeqNum) instruction dispatched so far */
++    InstSeqNum ifaMaxDispatchedSeqNum;
++
+   public:
+     /* Public so that Pipeline can pass it to Fetch1 */
+     std::vector<InputBuffer<ForwardLineData>> inputBuffer;
+@@ -162,7 +286,7 @@
+ 
+     struct Fetch2Stats : public statistics::Group
+     {
+-        Fetch2Stats(MinorCPU *cpu);
++        Fetch2Stats(MinorCPU *cpu, unsigned int ifa_buffer_size);
+         /** Stats */
+         statistics::Scalar totalInstructions;
+         statistics::Scalar intInstructions;
+@@ -171,6 +295,18 @@
+         statistics::Scalar loadInstructions;
+         statistics::Scalar storeInstructions;
+         statistics::Scalar amoInstructions;
++
++        /** IFA stats */
++        statistics::Scalar ifaDispatched;
++        statistics::Scalar ifaDispatchedOutOfOrder;
++        statistics::Scalar ifaHoisted;
++        statistics::Scalar ifaSkipped;
++        statistics::Scalar ifaHeadBlockedCycles;
++        statistics::Scalar ifaReorderCycles;
++        statistics::Scalar ifaBufferFullCycles;
++        statistics::Scalar ifaFlushes;
++        statistics::Scalar ifaFlushedInsts;
++        statistics::Distribution ifaOccupancy;
+     } stats;
+ 
+   protected:
+@@ -198,10 +334,39 @@
+      *  fetch from. */
+     ThreadID getScheduledThread();
+ 
++    /** IFA: does this instruction have to leave the FEB in program order?
++     *  Nothing younger may pass it and it may not pass anything older */
++    bool ifaIsBarrier(const MinorDynInstPtr &inst) const;
++
++    /** IFA: DAU test that all the sources of inst will be available when
++     *  it reaches issue, if it is dispatched now */
++    bool ifaSourcesReady(const MinorDynInstPtr &inst);
++
++    /** IFA: DAU test that inst can be dispatched before all the (older)
++     *  instructions in skipped, which are still in the FEB */
++    bool ifaCanPass(const MinorDynInstPtr &inst,
++        const std::vector<MinorDynInstPtr> &skipped) const;
++
++    /** IFA: note the destinations of a dispatched instruction in the shadow
++     *  scoreboard */
++    void ifaMarkupDispatch(const MinorDynInstPtr &inst);
++
++    /** IFA: dispatch instructions from the FEB into insts_out */
++    void ifaDispatch(ForwardInstData &insts_out);
++
++    /** IFA issue model: the cycle in which inst would issue in Execute if
++     *  it were dispatched next */
++    Cycles ifaEstimateIssue(const MinorDynInstPtr &inst) const;
++
++    /** IFA issue model: account for inst being dispatched to issue at
++     *  issue_cycle */
++    void ifaModelDispatch(const MinorDynInstPtr &inst, Cycles issue_cycle);
++
+   public:
+     Fetch2(const std::string &name,
+         MinorCPU &cpu_,
+         const BaseMinorCPUParams &params,
++        const Execute &execute_,
+         Latch<ForwardLineData>::Output inp_,
+         Latch<BranchData>::Output branchInp_,
+         Latch<BranchData>::Input predictionOut_,
+--- a/src/cpu/minor/fetch2.cc
++++ b/src/cpu/minor/fetch2.cc
+@@ -37,6 +37,7 @@
+ 
+ #include "cpu/minor/fetch2.hh"
+ 
++#include <algorithm>
+ #include <string>
+ 
+ #include "arch/generic/decoder.hh"
+@@ -58,6 +59,7 @@
+ Fetch2::Fetch2(const std::string &name,
+     MinorCPU &cpu_,
+     const BaseMinorCPUParams &params,
++    const Execute &execute_,
+     Latch<ForwardLineData>::Output inp_,
+     Latch<BranchData>::Output branchInp_,
+     Latch<BranchData>::Input predictionOut_,
+@@ -73,8 +75,39 @@
+     outputWidth(params.decodeInputWidth),
+     processMoreThanOneInput(params.fetch2CycleInput),
+     branchPredictor(*params.branchPred),
++    ifaMode(params.ifa_mode),
++    ifaBufferSize(params.ifa_buffer_size),
++    ifaDecodeWidth(params.ifa_decode_width),
++    ifaLatency(params.ifa_latency),
++    ifaFlushOnStreamChange(params.ifa_flush_on_stream_change),
++    ifaDAUSource(params.ifa_dau_source),
++    ifaLoadLatency(params.ifa_load_latency),
++    ifaPassMemoryRefs(params.ifa_pass_memory_refs),
++    ifaHoistMemoryRefs(params.ifa_hoist_memory_refs),
++    ifaFillWhenBlocked(params.ifa_mode != 0 && params.ifa_fill_when_blocked),
++    ifaQueueAware(params.ifa_queue_aware),
++    decodeInputBufferSize(params.decodeInputBufferSize),
++    ifaIssueModel(params.ifa_issue_model),
++    ifaIssueLimit(params.executeIssueLimit),
++    ifaFUOpLat(Num_OpClasses, Cycles(0)),
++    ifaFURelLats(Num_OpClasses),
++    ifaOpFU(Num_OpClasses, -1),
++    ifaFUIssueLat(Num_OpClasses, Cycles(1)),
++    ifaModelLastIssue(0),
++    ifaModelNumAtLast(0),
++    ifaModelMemAtLast(false),
++    ifaModelFUFree(params.executeFuncUnits->funcUnits.size(), Cycles(0)),
++    execute(execute_),
++    ifaDispatchToIssue(params.fetch2ToDecodeForwardDelay +
++        params.decodeToExecuteForwardDelay),
++    ifaShadow(name + ".ifaShadow",
++        cpu_.threads[0]->getIsaPtr()->regClasses()),
++    ifaOpLatency(Num_OpClasses, Cycles(0)),
++    ifaSrcRelativeLatency(0),
++    ifaArrival(0),
++    ifaMaxDispatchedSeqNum(0),
+     fetchInfo(params.numThreads),
+-    threadPriority(0), stats(&cpu_)
++    threadPriority(0), stats(&cpu_, params.ifa_buffer_size)
+ {
+     if (outputWidth < 1)
+         fatal("%s: decodeInputWidth must be >= 1 (%d)\n", name, outputWidth);
+@@ -91,6 +124,67 @@
+                 name + ".inputBuffer" + std::to_string(tid), "lines",
+                 params.fetch2InputBufferSize));
+     }
++
++    if (ifaMode > 2)
++        fatal("%s: ifa_mode must be 0, 1 or 2 (%d)\n", name, ifaMode);
++
++    if (ifaMode != 0) {
++        if (params.numThreads != 1) {
++            fatal("%s: the IFA only supports one thread (numThreads: %d)\n",
++                name, params.numThreads);
++        }
++
++        if (ifaBufferSize < 1) {
++            fatal("%s: ifa_buffer_size must be >= 1 (%d)\n", name,
++                ifaBufferSize);
++        }
++
++        if (ifaPassMemoryRefs && ifaHoistMemoryRefs) {
++            fatal("%s: ifa_pass_memory_refs and ifa_hoist_memory_refs"
++                " can't be used together\n", name);
++        }
++    }
++
++    /* Take the DAU's latency estimates from the Execute FU descriptions.
++     *  The FU used is the first that provides the OpClass, as in
++     *  Execute::issue */
++    const std::vector<MinorFU *> &fus = params.executeFuncUnits->funcUnits;
++
++    for (MinorFU *fu : fus) {
++        if (fu->opClasses->provides(IntAluOp)) {
++            if (!fu->timings.empty() &&
++                !fu->timings[0]->srcRegsRelativeLats.empty())
++            {
++                ifaSrcRelativeLatency =
++                    fu->timings[0]->srcRegsRelativeLats.back();
++            }
++            break;
++        }
++    }
++
++    for (int op_class = 0; op_class < Num_OpClasses; op_class++) {
++        for (int fu_index = 0; fu_index < fus.size(); fu_index++) {
++            MinorFU *fu = fus[fu_index];
++
++            if (fu->opClasses->provides(static_cast<OpClass>(op_class))) {
++                ifaFUOpLat[op_class] = fu->opLat + (fu->timings.empty() ?
++                    Cycles(0) : fu->timings[0]->extraAssumedLat);
++                if (!fu->timings.empty()) {
++                    ifaFURelLats[op_class] =
++                        fu->timings[0]->srcRegsRelativeLats;
++                }
++                ifaOpFU[op_class] = fu_index;
++                ifaFUIssueLat[op_class] = fu->issueLat;
++
++                Cycles latency = fu->opLat + (fu->timings.empty() ?
++                    Cycles(0) : fu->timings[0]->extraAssumedLat);
++
++                ifaOpLatency[op_class] = (latency > ifaSrcRelativeLatency ?
++                    Cycles(latency - ifaSrcRelativeLatency) : Cycles(0));
++                break;
++            }
++        }
++    }
+ }
+ 
+ const ForwardLineData *
+@@ -236,6 +330,417 @@
+     }
+ }
+ 
++bool
++Fetch2::ifaIsBarrier(const MinorDynInstPtr &inst) const
++{
++    if (inst->isFault())
++        return true;
++
++    const StaticInstPtr &static_inst = inst->staticInst;
++
++    /* Control instructions are barriers because Execute discards everything
++     *  it receives after a mispredicted branch.  Things which can fault and
++     *  aren't memory references, or which act on more state than their
++     *  register operands, must stay in order for exceptions to be precise */
++    return static_inst->isControl() ||
++        static_inst->isSyscall() ||
++        static_inst->isSerializing() ||
++        static_inst->isNonSpeculative() ||
++        static_inst->isSquashAfter() ||
++        static_inst->isReadBarrier() ||
++        static_inst->isWriteBarrier() ||
++        static_inst->isAtomic() ||
++        static_inst->isMacroop() ||
++        static_inst->isMicroop() ||
++        static_inst->isQuiesce() ||
++        static_inst->isHtmCmd() ||
++        static_inst->isInvalid();
++}
++
++/** Do the register operands of a (dests or srcs) and b (dests or srcs)
++ *  have a register in common?  Invalid registers (such as RISC-V's x0)
++ *  carry no dependencies */
++static bool
++ifaRegsOverlap(const StaticInstPtr &a, bool a_dests,
++    const StaticInstPtr &b, bool b_dests)
++{
++    int num_a = (a_dests ? a->numDestRegs() : a->numSrcRegs());
++    int num_b = (b_dests ? b->numDestRegs() : b->numSrcRegs());
++
++    for (int i = 0; i < num_a; i++) {
++        const RegId &reg_a = (a_dests ? a->destRegIdx(i) : a->srcRegIdx(i));
++
++        if (reg_a.classValue() == InvalidRegClass)
++            continue;
++
++        for (int j = 0; j < num_b; j++) {
++            if (reg_a == (b_dests ? b->destRegIdx(j) : b->srcRegIdx(j)))
++                return true;
++        }
++    }
++
++    return false;
++}
++
++bool
++Fetch2::ifaSourcesReady(const MinorDynInstPtr &inst)
++{
++    if (inst->isFault())
++        return true;
++
++    const StaticInstPtr &static_inst = inst->staticInst;
++    ThreadID tid = inst->id.threadId;
++    auto *isa = cpu.getContext(tid)->getIsaPtr();
++    /* inst can reach issue in Execute no earlier than this */
++    Cycles arrival = ifaArrival;
++
++    for (int i = 0; i < static_inst->numSrcRegs(); i++) {
++        RegId reg = static_inst->srcRegIdx(i).flatten(*isa);
++        Scoreboard::Index index;
++
++        if (!ifaShadow.findIndex(reg, index))
++            continue;
++
++        /* Producers dispatched by Fetch2, including those not yet in
++         *  Execute, with their estimated latency */
++        if (ifaDAUSource != enums::IFAScoreboard &&
++            ifaShadow.returnCycle[index] > arrival)
++        {
++            return false;
++        }
++
++        /* Producers in Execute.  A memory reference which hasn't completed
++         *  is waited for whatever the shadow estimate (it may have
++         *  missed in the cache) */
++        if (ifaDAUSource != enums::IFAShadow) {
++            Execute::IFARegState state = execute.ifaRegState(tid, reg);
++
++            if (state.memPending)
++                return false;
++
++            if (ifaDAUSource == enums::IFAScoreboard && state.pending &&
++                state.returnCycle > arrival + ifaSrcRelativeLatency)
++            {
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
++bool
++Fetch2::ifaCanPass(const MinorDynInstPtr &inst,
++    const std::vector<MinorDynInstPtr> &skipped) const
++{
++    const StaticInstPtr &static_inst = inst->staticInst;
++
++    /* Barriers only leave in program order */
++    if (ifaIsBarrier(inst))
++        return false;
++
++    /* Memory references normally leave in program order too.  This keeps
++     *  the order of memory accesses and makes a faulting access precise:
++     *  nothing older is left undispatched behind it.  When hoisting, a
++     *  memory reference can pass the head if nothing younger than the
++     *  head has been dispatched: if it faults, restarting from the head
++     *  executes nothing twice */
++    if (static_inst->isMemRef()) {
++        if (!ifaHoistMemoryRefs ||
++            ifaMaxDispatchedSeqNum >= skipped.front()->id.fetchSeqNum)
++        {
++            return false;
++        }
++    }
++
++    /* If an older memory reference which inst passes faults after inst has
++     *  committed, inst will be executed again when the fault returns.  That
++     *  is only safe if it doesn't overwrite one of its own sources, and
++     *  still adds to the committed instruction count */
++    bool can_pass_memory_refs = ifaPassMemoryRefs &&
++        !ifaRegsOverlap(static_inst, true, static_inst, false);
++
++    for (const MinorDynInstPtr &older : skipped) {
++        const StaticInstPtr &older_inst = older->staticInst;
++
++        if (older_inst->isMemRef() &&
++            (!can_pass_memory_refs || static_inst->isMemRef()))
++        {
++            return false;
++        }
++
++        if (ifaRegsOverlap(older_inst, true, static_inst, false) || /* RAW */
++            ifaRegsOverlap(older_inst, false, static_inst, true) || /* WAR */
++            ifaRegsOverlap(older_inst, true, static_inst, true)) /* WAW */
++        {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++void
++Fetch2::ifaMarkupDispatch(const MinorDynInstPtr &inst)
++{
++    if (inst->isFault())
++        return;
++
++    const StaticInstPtr &static_inst = inst->staticInst;
++    auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
++    Cycles ready = ifaArrival +
++        (static_inst->isMemRef() ? ifaLoadLatency :
++            ifaOpLatency[static_inst->opClass()]);
++
++    for (int i = 0; i < static_inst->numDestRegs(); i++) {
++        RegId reg = static_inst->destRegIdx(i).flatten(*isa);
++        Scoreboard::Index index;
++
++        if (ifaShadow.findIndex(reg, index))
++            ifaShadow.returnCycle[index] = ready;
++    }
++}
++
++Cycles
++Fetch2::ifaEstimateIssue(const MinorDynInstPtr &inst) const
++{
++    /* In order: not before the last dispatched instruction */
++    Cycles issue = std::max(ifaModelLastIssue, ifaArrival);
++
++    if (!inst->isFault()) {
++        const StaticInstPtr &static_inst = inst->staticInst;
++        OpClass op_class = static_inst->opClass();
++        const std::vector<Cycles> &rel_lats = ifaFURelLats[op_class];
++        auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
++
++        /* As Scoreboard::canInstIssue: a source is available from its
++         *  returnCycle less the source's relative latency */
++        for (int i = 0; i < static_inst->numSrcRegs(); i++) {
++            RegId reg = static_inst->srcRegIdx(i).flatten(*isa);
++            Scoreboard::Index index;
++
++            if (!ifaShadow.findIndex(reg, index))
++                continue;
++
++            Cycles rel_lat = (rel_lats.empty() ? Cycles(0) :
++                rel_lats[std::min<size_t>(i, rel_lats.size() - 1)]);
++            Cycles ready = ifaShadow.returnCycle[index];
++
++            if (ready > issue + rel_lat)
++                issue = Cycles(ready - rel_lat);
++        }
++
++        int fu_index = ifaOpFU[op_class];
++        if (fu_index >= 0)
++            issue = std::max(issue, ifaModelFUFree[fu_index]);
++    }
++
++    /* Execute issues up to ifaIssueLimit instructions a cycle and stops
++     *  after a memory reference */
++    if (issue == ifaModelLastIssue &&
++        (ifaModelNumAtLast >= ifaIssueLimit || ifaModelMemAtLast))
++    {
++        issue = Cycles(issue + 1);
++    }
++
++    return issue;
++}
++
++void
++Fetch2::ifaModelDispatch(const MinorDynInstPtr &inst, Cycles issue_cycle)
++{
++    bool is_mem = !inst->isFault() && inst->staticInst->isMemRef();
++
++    if (issue_cycle > ifaModelLastIssue) {
++        ifaModelLastIssue = issue_cycle;
++        ifaModelNumAtLast = 1;
++        ifaModelMemAtLast = is_mem;
++    } else {
++        ifaModelNumAtLast++;
++        ifaModelMemAtLast = ifaModelMemAtLast || is_mem;
++    }
++
++    if (inst->isFault())
++        return;
++
++    const StaticInstPtr &static_inst = inst->staticInst;
++    OpClass op_class = static_inst->opClass();
++    auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
++
++    for (int i = 0; i < static_inst->numDestRegs(); i++) {
++        RegId reg = static_inst->destRegIdx(i).flatten(*isa);
++        Scoreboard::Index index;
++
++        if (ifaShadow.findIndex(reg, index)) {
++            ifaShadow.returnCycle[index] =
++                Cycles(issue_cycle + ifaFUOpLat[op_class]);
++        }
++    }
++
++    int fu_index = ifaOpFU[op_class];
++    if (fu_index >= 0 && ifaFUIssueLat[op_class] > 1) {
++        ifaModelFUFree[fu_index] =
++            Cycles(issue_cycle + ifaFUIssueLat[op_class]);
++    }
++}
++
++void
++Fetch2::ifaDispatch(ForwardInstData &insts_out)
++{
++    const Cycles now = cpu.curCycle();
++    unsigned int output_index = 0;
++    bool passed_head = false;
++
++    auto dispatchable = [&](const IFAEntry &entry) {
++        return entry.dispatchableCycle <= now;
++    };
++
++    /* Move an entry to the output, returning the entry after it */
++    auto dispatch = [&](std::deque<IFAEntry>::iterator entry,
++        bool out_of_order)
++    {
++        MinorDynInstPtr inst = entry->inst;
++
++        if (output_index == 0)
++            insts_out.resize(outputWidth);
++        insts_out.insts[output_index] = inst;
++        output_index++;
++
++        if (ifaIssueModel)
++            ifaModelDispatch(inst, ifaEstimateIssue(inst));
++        else
++            ifaMarkupDispatch(inst);
++        ifaMaxDispatchedSeqNum = std::max(ifaMaxDispatchedSeqNum,
++            inst->id.fetchSeqNum);
++        stats.ifaDispatched++;
++        if (out_of_order) {
++            stats.ifaDispatchedOutOfOrder++;
++            passed_head = true;
++        }
++
++        DPRINTF(Fetch, "IFA dispatching%s inst: %s\n",
++            (out_of_order ? " out of order" : ""), *inst);
++
++        return ifaBuffer.erase(entry);
++    };
++
++    if (ifaBuffer.empty() || !dispatchable(ifaBuffer.front()))
++        return;
++
++    /* Instructions dispatched now reach issue after the latches and, if
++     *  asked, after the instructions already queued in Decode's and
++     *  Execute's input buffers (each holding one cycle's worth of
++     *  instructions) */
++    ifaArrival = now + ifaDispatchToIssue;
++    if (ifaQueueAware) {
++        ThreadID tid = ifaBuffer.front().inst->id.threadId;
++
++        ifaArrival += Cycles(decodeInputBufferSize -
++            nextStageReserve[tid].unreservedRemainingSpace() +
++            execute.ifaInputBufferOccupancy(tid));
++    }
++
++    bool head_blocked = (ifaIssueModel ?
++        ifaEstimateIssue(ifaBuffer.front().inst) >
++            Cycles(std::max(ifaModelLastIssue, ifaArrival) + 1) :
++        !ifaSourcesReady(ifaBuffer.front().inst));
++
++    if (head_blocked)
++        stats.ifaHeadBlockedCycles++;
++
++    if (ifaMode == 2 && ifaIssueModel) {
++        /* List scheduling: each slot gets the legal instruction which would
++         *  issue earliest, the oldest on a tie */
++        while (output_index < outputWidth && !ifaBuffer.empty()) {
++            std::vector<MinorDynInstPtr> older;
++            auto best = ifaBuffer.end();
++            Cycles best_issue(0);
++            MinorDynInstPtr best_passed_head = nullptr;
++            unsigned int best_num_passed = 0;
++
++            for (auto entry = ifaBuffer.begin();
++                entry != ifaBuffer.end() && dispatchable(*entry); entry++)
++            {
++                const MinorDynInstPtr &inst = entry->inst;
++
++                if (older.empty() || ifaCanPass(inst, older)) {
++                    Cycles issue = ifaEstimateIssue(inst);
++
++                    if (best == ifaBuffer.end() || issue < best_issue) {
++                        best = entry;
++                        best_issue = issue;
++                        best_passed_head =
++                            (older.empty() ? nullptr : older.front());
++                        best_num_passed = older.size();
++                    }
++                }
++
++                /* Nothing younger can pass a barrier */
++                if (ifaIsBarrier(inst))
++                    break;
++                older.push_back(inst);
++            }
++
++            if (best == ifaBuffer.end())
++                break;
++
++            const MinorDynInstPtr inst = best->inst;
++
++            if (best_num_passed != 0 && inst->staticInst->isMemRef()) {
++                /* A hoisted memory reference: a fault in it must restart
++                 *  from the oldest instruction it passed */
++                set(inst->ifaRestartPC, best_passed_head->pc);
++                stats.ifaHoisted++;
++            }
++            stats.ifaSkipped += best_num_passed;
++
++            dispatch(best, best_num_passed != 0);
++        }
++    } else if (ifaMode == 2) {
++        /* Older instructions which the scan has left in the FEB */
++        std::vector<MinorDynInstPtr> skipped;
++        auto entry = ifaBuffer.begin();
++
++        while (entry != ifaBuffer.end() && dispatchable(*entry) &&
++            output_index < outputWidth)
++        {
++            const MinorDynInstPtr inst = entry->inst;
++
++            if (ifaSourcesReady(inst) &&
++                (skipped.empty() || ifaCanPass(inst, skipped)))
++            {
++                if (!skipped.empty() && inst->staticInst->isMemRef()) {
++                    /* A hoisted memory reference: a fault in it must
++                     *  restart from the oldest instruction it passed */
++                    set(inst->ifaRestartPC, skipped.front()->pc);
++                    stats.ifaHoisted++;
++                }
++                entry = dispatch(entry, !skipped.empty());
++            } else if (ifaIsBarrier(inst)) {
++                /* Nothing younger can pass a barrier */
++                break;
++            } else {
++                DPRINTF(Fetch, "IFA skipping inst: %s\n", *inst);
++                skipped.push_back(inst);
++                stats.ifaSkipped++;
++                entry++;
++            }
++        }
++    }
++
++    /* Fill the rest of the output in program order.  This is all of
++     *  dispatch in mode 1 and, in mode 2, makes sure the IFA never sends
++     *  fewer instructions than in-order dispatch would */
++    while (output_index < outputWidth && !ifaBuffer.empty() &&
++        dispatchable(ifaBuffer.front()))
++    {
++        dispatch(ifaBuffer.begin(), false);
++    }
++
++    if (head_blocked && passed_head)
++        stats.ifaReorderCycles++;
++}
++
+ void
+ Fetch2::evaluate()
+ {
+@@ -260,6 +765,25 @@
+             " has arrived\n");
+         dumpAllInput(branch_inp.threadId);
+         fetchInfo[branch_inp.threadId].havePC = false;
++
++        /* Instructions in the FEB from the old stream would only be
++         *  discarded by Execute */
++        if (ifaMode != 0 && ifaFlushOnStreamChange) {
++            auto old_stream = std::remove_if(ifaBuffer.begin(),
++                ifaBuffer.end(), [&](const IFAEntry &entry) {
++                    return entry.inst->id.streamSeqNum !=
++                        branch_inp.newStreamSeqNum;
++                });
++            unsigned int num_flushed = ifaBuffer.end() - old_stream;
++
++            if (num_flushed != 0) {
++                DPRINTF(Fetch, "IFA discarding %d FEB entries\n",
++                    num_flushed);
++                stats.ifaFlushes++;
++                stats.ifaFlushedInsts += num_flushed;
++                ifaBuffer.erase(old_stream, ifaBuffer.end());
++            }
++        }
+     }
+ 
+     assert(insts_out.isBubble());
+@@ -303,13 +827,20 @@
+ 
+         unsigned int output_index = 0;
+ 
+-        /* Pack instructions into the output while we can.  This may involve
+-         * using more than one input line.  Note that lineWidth will be 0
+-         * for faulting lines */
++        /* Number of instructions put into the FEB this cycle */
++        unsigned int ifa_num_decoded = 0;
++
++        /* Pack instructions into the output (or, with the IFA, the FEB)
++         * while we can.  This may involve using more than one input line.
++         * Note that lineWidth will be 0 for faulting lines */
+         while (line_in &&
+             (line_in->isFault() ||
+                 fetch_info.inputIndex < line_in->lineWidth) && /* More input */
+-            output_index < outputWidth && /* More output to fill */
++            (ifaMode == 0 ?
++                output_index < outputWidth : /* More output to fill */
++                (ifaBuffer.size() < ifaBufferSize && /* FEB space */
++                    (ifaDecodeWidth == 0 ||
++                        ifa_num_decoded < ifaDecodeWidth))) &&
+             prediction.isBubble() /* No predicted branch */)
+         {
+             ThreadContext *thread = cpu.getContext(line_in->id.threadId);
+@@ -480,13 +1011,21 @@
+                 /* Step to next sequence number */
+                 fetch_info.fetchSeqNum++;
+ 
+-                /* Correctly size the output before writing */
+-                if (output_index == 0) {
+-                    insts_out.resize(outputWidth);
++                if (ifaMode != 0) {
++                    /* The IFA dispatches from the FEB below */
++                    ifaBuffer.push_back(
++                        IFAEntry{dyn_inst, cpu.curCycle() + ifaLatency});
++                    ifa_num_decoded++;
++                } else {
++                    /* Correctly size the output before writing */
++                    if (output_index == 0) {
++                        insts_out.resize(outputWidth);
++                    }
++                    /* Pack the generated dynamic instruction into the
++                     *  output */
++                    insts_out.insts[output_index] = dyn_inst;
++                    output_index++;
+                 }
+-                /* Pack the generated dynamic instruction into the output */
+-                insts_out.insts[output_index] = dyn_inst;
+-                output_index++;
+ 
+                 /* Output MinorTrace instruction info for
+                  *  pre-microop decomposition macroops */
+@@ -529,6 +1068,16 @@
+             }
+         }
+ 
++        if (ifaMode != 0) {
++            if (ifaBuffer.size() >= ifaBufferSize && getInput(tid))
++                stats.ifaBufferFullCycles++;
++
++            /* With ifaFillWhenBlocked, this thread may only have been
++             *  scheduled to fill the FEB */
++            if (!fetch_info.blocked)
++                ifaDispatch(insts_out);
++        }
++
+         /* The rest of the output (if any) should already have been packed
+          *  with bubble instructions by insts_out's initialisation */
+     }
+@@ -551,12 +1100,19 @@
+      *  mark stage as active */
+     for (ThreadID i = 0; i < cpu.numThreads; i++)
+     {
+-        if (getInput(i) && nextStageReserve[i].canReserve()) {
++        if (((getInput(i) || !ifaBuffer.empty()) &&
++                nextStageReserve[i].canReserve()) ||
++            (ifaFillWhenBlocked && getInput(i) &&
++                ifaBuffer.size() < ifaBufferSize))
++        {
+             cpu.activityRecorder->activateStage(Pipeline::Fetch2StageId);
+             break;
+         }
+     }
+ 
++    if (ifaMode != 0)
++        stats.ifaOccupancy.sample(ifaBuffer.size());
++
+     /* Make sure the input (if any left) is pushed */
+     if (!inp.outputWire->isBubble())
+         inputBuffer[inp.outputWire->id.threadId].pushTail();
+@@ -583,7 +1139,11 @@
+     }
+ 
+     for (auto tid : priority_list) {
+-        if (getInput(tid) && !fetchInfo[tid].blocked) {
++        if (((getInput(tid) || !ifaBuffer.empty()) &&
++                !fetchInfo[tid].blocked) ||
++            (ifaFillWhenBlocked && getInput(tid) &&
++                ifaBuffer.size() < ifaBufferSize))
++        {
+             threadPriority = tid;
+             return tid;
+         }
+@@ -600,11 +1160,13 @@
+             return false;
+     }
+ 
+-    return (*inp.outputWire).isBubble() &&
++    return ifaBuffer.empty() &&
++           (*inp.outputWire).isBubble() &&
+            (*predictionOut.inputWire).isBubble();
+ }
+ 
+-Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu)
++Fetch2::Fetch2Stats::Fetch2Stats(MinorCPU *cpu,
++    unsigned int ifa_buffer_size)
+     : statistics::Group(cpu, "fetch2"),
+       ADD_STAT(totalInstructions, statistics::units::Count::get(),
+                "Total number of instructions successfully decoded"),
+@@ -619,7 +1181,33 @@
+       ADD_STAT(storeInstructions, statistics::units::Count::get(),
+                "Number of memory store instructions successfully decoded"),
+       ADD_STAT(amoInstructions, statistics::units::Count::get(),
+-               "Number of memory atomic instructions successfully decoded")
++               "Number of memory atomic instructions successfully decoded"),
++      ADD_STAT(ifaDispatched, statistics::units::Count::get(),
++               "Number of instructions dispatched from the IFA FEB"),
++      ADD_STAT(ifaDispatchedOutOfOrder, statistics::units::Count::get(),
++               "Number of instructions dispatched from the IFA FEB while an"
++               " older instruction stayed in it"),
++      ADD_STAT(ifaHoisted, statistics::units::Count::get(),
++               "Number of memory references dispatched from the IFA FEB"
++               " before older instructions"),
++      ADD_STAT(ifaSkipped, statistics::units::Count::get(),
++               "Number of times the IFA dispatch scan left an instruction in"
++               " the FEB to look at younger ones"),
++      ADD_STAT(ifaHeadBlockedCycles, statistics::units::Cycle::get(),
++               "Number of cycles in which the oldest FEB instruction could"
++               " be dispatched but the DAU found it not ready"),
++      ADD_STAT(ifaReorderCycles, statistics::units::Cycle::get(),
++               "Number of cycles in which the oldest FEB instruction was not"
++               " ready and a younger one was dispatched before it"),
++      ADD_STAT(ifaBufferFullCycles, statistics::units::Cycle::get(),
++               "Number of cycles in which input could not be decoded"
++               " because the IFA FEB was full"),
++      ADD_STAT(ifaFlushes, statistics::units::Count::get(),
++               "Number of stream changes which discarded IFA FEB entries"),
++      ADD_STAT(ifaFlushedInsts, statistics::units::Count::get(),
++               "Number of IFA FEB entries discarded on stream changes"),
++      ADD_STAT(ifaOccupancy, statistics::units::Count::get(),
++               "Number of IFA FEB entries at the end of each cycle")
+ {
+     totalInstructions.flags(statistics::total);
+     intInstructions.flags(statistics::total);
+@@ -628,6 +1216,8 @@
+     loadInstructions.flags(statistics::total);
+     storeInstructions.flags(statistics::total);
+     amoInstructions.flags(statistics::total);
++
++    ifaOccupancy.init(0, ifa_buffer_size, 1);
+ }
+ 
+ void
+--- a/src/cpu/minor/execute.hh
++++ b/src/cpu/minor/execute.hh
+@@ -124,6 +124,23 @@
+     /** Scoreboard of instruction dependencies */
+     std::vector<Scoreboard> scoreboard;
+ 
++    /** Copy of scoreboard taken at the start of each cycle for the IFA in
++     *  Fetch2.  Execute is evaluated before Fetch2 in the same cycle, so
++     *  reading scoreboard directly would give Fetch2 the effect of this
++     *  cycle's issue and commit with no delay */
++    std::vector<Scoreboard> ifaScoreboardSnapshot;
++
++    /** Keep ifaScoreboardSnapshot up to date */
++    bool ifaNeedsScoreboard;
++
++    /** Number of input buffer slots (occupied or reserved) at the start of
++     *  this cycle, and at the end of this cycle, for the IFA */
++    std::vector<unsigned int> ifaInputOccupancy;
++    std::vector<unsigned int> ifaNextInputOccupancy;
++
++    /** Capacity of each input buffer */
++    unsigned int inputBufferSize;
++
+     /** The execution functional units */
+     std::vector<FUPipeline *> funcUnits;
+ 
+@@ -213,6 +230,10 @@
+   protected:
+     friend std::ostream &operator <<(std::ostream &os, DrainState state);
+ 
++    /** If the IFA dispatched inst before older instructions, make a fault
++     *  in inst restart execution from the oldest of them */
++    void ifaPrepareFault(MinorDynInstPtr inst, ThreadContext *thread);
++
+     /** Get a piece of data to work on from the inputBuffer, or 0 if there
+      *  is no data. */
+     const ForwardInstData *getInput(ThreadID tid);
+@@ -347,6 +368,33 @@
+     /** Pass on input/buffer data to the output if you can */
+     void evaluate();
+ 
++    /** State of a register in the scoreboard, as seen by the IFA */
++    struct IFARegState
++    {
++        /** An in-flight instruction will write the register */
++        bool pending = false;
++
++        /** The most recent writer is a memory reference which has not
++         *  completed, so its result time can't be predicted */
++        bool memPending = false;
++
++        /** Scoreboard's estimate of when the result will be available
++         *  (see Scoreboard::returnCycle) */
++        Cycles returnCycle = Cycles(0);
++    };
++
++    /** The state of a (flattened) register in the scoreboard at the start
++     *  of the current cycle, for the IFA's dependency analysis in Fetch2 */
++    IFARegState ifaRegState(ThreadID thread_id, const RegId &reg) const;
++
++    /** Number of input buffer slots, occupied or reserved by instructions
++     *  on their way from Decode, at the start of the current cycle */
++    unsigned int
++    ifaInputBufferOccupancy(ThreadID thread_id) const
++    {
++        return ifaInputOccupancy[thread_id];
++    }
++
+     void minorTrace() const;
+ 
+     /** After thread suspension, has Execute been drained of in-flight
+@@ -357,10 +405,26 @@
+     unsigned int drain();
+     void drainResume();
+ 
++    /** Why issue stopped in a cycle */
++    enum IssueStop
++    {
++        IssueStopFull, /* Issued executeIssueLimit instructions */
++        IssueStopNoInput, /* No (more) instructions to issue */
++        IssueStopOperands, /* Next instruction's sources not ready */
++        IssueStopFU, /* No capable FU could accept the next instruction */
++        IssueStopMemLimit, /* executeMemoryIssueLimit reached */
++        IssueStopOther,
++        NumIssueStop
++    };
++
++    /** Why the last call to issue stopped */
++    IssueStop issueStop;
++
+     struct IssueStats : public statistics::Group
+     {
+         IssueStats(MinorCPU *cpu);
+         statistics::Vector2d issuedInstType;
++        statistics::Vector issueStopCycles;
+     } issueStats;
+ };
+ 
+--- a/src/cpu/minor/execute.cc
++++ b/src/cpu/minor/execute.cc
+@@ -79,6 +79,11 @@
+       setTraceTimeOnIssue(params.executeSetTraceTimeOnIssue),
+       allowEarlyMemIssue(params.executeAllowEarlyMemoryIssue),
+       noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
++      ifaNeedsScoreboard(params.ifa_mode != 0 &&
++          params.ifa_dau_source != enums::IFAShadow),
++      ifaInputOccupancy(params.numThreads, 0),
++      ifaNextInputOccupancy(params.numThreads, 0),
++      inputBufferSize(params.executeInputBufferSize),
+       lsq(name_ + ".lsq", name_ + ".dcache_port", cpu_, *this,
+           params.executeMaxAccessesInMemory, params.executeMemoryWidth,
+           params.executeLSQRequestsQueueSize,
+@@ -90,6 +95,7 @@
+       interruptPriority(0),
+       issuePriority(0),
+       commitPriority(0),
++      issueStop(IssueStopNoInput),
+       issueStats(&cpu_)
+ {
+     if (commitLimit < 1) {
+@@ -180,6 +186,10 @@
+ 
+         /* Scoreboards */
+         scoreboard.emplace_back(name_ + ".scoreboard" + tid_str, regClasses);
++        if (ifaNeedsScoreboard) {
++            ifaScoreboardSnapshot.emplace_back(
++                name_ + ".ifaScoreboardSnapshot" + tid_str, regClasses);
++        }
+ 
+         /* In-flight instruction records */
+         executeInfo[tid].inFlightInsts =  new Queue<QueuedInst,
+@@ -353,6 +363,7 @@
+             /* Take the fault raised during the TLB/memory access */
+             fault = inst->translationFault;
+ 
++            ifaPrepareFault(inst, thread);
+             fault->invoke(thread, inst->staticInst);
+         }
+     } else if (!packet) {
+@@ -385,6 +396,7 @@
+             /* Invoke fault created by instruction completion */
+             DPRINTF(MinorMem, "Fault in memory completeAcc: %s\n",
+                 fault->name());
++            ifaPrepareFault(inst, thread);
+             fault->invoke(thread, inst->staticInst);
+         } else {
+             /* Stores need to be pushed into the store buffer to finish
+@@ -546,8 +558,14 @@
+     ExecuteThreadInfo &thread = executeInfo[thread_id];
+ 
+     /* Early termination if we have no instructions */
+-    if (!insts_in)
++    if (!insts_in) {
++        issueStop = IssueStopNoInput;
+         return 0;
++    }
++
++    /* Why the instruction being tried could not be issued */
++    bool failed_operands = false;
++    bool failed_fu = false;
+ 
+     /* Start from the first FU */
+     unsigned int fu_index = 0;
+@@ -591,6 +609,8 @@
+             /* Try and issue an instruction into an FU, assume we didn't and
+              * fix that in the loop */
+             issued = false;
++            failed_operands = false;
++            failed_fu = false;
+ 
+             /* Try FU from 0 each instruction */
+             fu_index = 0;
+@@ -637,6 +657,8 @@
+ 
+                 } else if (!fu_is_capable || fu->alreadyPushed()) {
+                     /* Skip */
++                    if (fu_is_capable)
++                        failed_fu = true;
+                     if (!fu_is_capable) {
+                         DPRINTF(MinorExecute, "Can't issue as FU: %d isn't"
+                             " capable\n", fu_index);
+@@ -645,10 +667,12 @@
+                             " already busy\n", fu_index);
+                     }
+                 } else if (fu->stalled) {
++                    failed_fu = true;
+                     DPRINTF(MinorExecute, "Can't issue inst: %s into FU: %d,"
+                         " it's stalled\n",
+                         *inst, fu_index);
+                 } else if (!fu->canInsert()) {
++                    failed_fu = true;
+                     DPRINTF(MinorExecute, "Can't issue inst: %s to busy FU"
+                         " for another: %d cycles\n",
+                         *inst, fu->cyclesBeforeInsert());
+@@ -671,6 +695,7 @@
+                         src_latencies, cant_forward_from_fu_indices,
+                         cpu.curCycle(), cpu.getContext(thread_id)))
+                     {
++                        failed_operands = true;
+                         DPRINTF(MinorExecute, "Can't issue inst: %s yet\n",
+                             *inst);
+                     } else {
+@@ -841,6 +866,19 @@
+         num_insts_issued != issueLimit && /* Still allowed to issue */
+         num_mem_insts_issued != memoryIssueLimit);
+ 
++    if (!issued) {
++        issueStop = (failed_operands ? IssueStopOperands :
++            (failed_fu ? IssueStopFU : IssueStopOther));
++    } else if (num_insts_issued == issueLimit) {
++        issueStop = IssueStopFull;
++    } else if (insts_in && thread.inputIndex < insts_in->width() &&
++        num_mem_insts_issued == memoryIssueLimit)
++    {
++        issueStop = IssueStopMemLimit;
++    } else {
++        issueStop = IssueStopNoInput;
++    }
++
+     return num_insts_issued;
+ }
+ 
+@@ -1009,6 +1047,7 @@
+             } else {
+                 DPRINTF(MinorExecute, "Fault in execute: %s\n",
+                     fault->name());
++                ifaPrepareFault(inst, thread);
+                 fault->invoke(thread, NULL);
+ 
+                 tryToBranch(inst, fault, branch);
+@@ -1497,6 +1536,21 @@
+ 
+     unsigned int num_issued = 0;
+ 
++    /* Remember the scoreboard and input buffer as they were at the end of
++     *  the last cycle for Fetch2's IFA, which is evaluated after this stage */
++    ifaInputOccupancy = ifaNextInputOccupancy;
++    if (ifaNeedsScoreboard) {
++        for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
++            Scoreboard &snapshot = ifaScoreboardSnapshot[tid];
++
++            snapshot.numResults = scoreboard[tid].numResults;
++            snapshot.numUnpredictableResults =
++                scoreboard[tid].numUnpredictableResults;
++            snapshot.fuIndices = scoreboard[tid].fuIndices;
++            snapshot.returnCycle = scoreboard[tid].returnCycle;
++        }
++    }
++
+     /* Do all the cycle-wise activities for dcachePort here to potentially
+      *  free up input spaces in the LSQ's requests queue */
+     lsq.step();
+@@ -1567,6 +1621,9 @@
+             DPRINTF(MinorExecute, "Attempting to issue [tid:%d]\n",
+                     issue_tid);
+             num_issued = issue(issue_tid);
++            issueStats.issueStopCycles[issueStop]++;
++        } else {
++            issueStats.issueStopCycles[IssueStopNoInput]++;
+         }
+ 
+     }
+@@ -1672,6 +1729,11 @@
+     /* Make sure the input (if any left) is pushed */
+     if (!inp.outputWire->isBubble())
+         inputBuffer[inp.outputWire->threadId].pushTail();
++
++    for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
++        ifaNextInputOccupancy[tid] = inputBufferSize -
++            inputBuffer[tid].unreservedRemainingSpace();
++    }
+ }
+ 
+ ThreadID
+@@ -1721,6 +1783,43 @@
+ }
+ 
+ void
++Execute::ifaPrepareFault(MinorDynInstPtr inst, ThreadContext *thread)
++{
++    /* Instructions older than inst which the IFA let it pass have not been
++     *  executed.  Fault from the oldest of them, as if it had faulted:
++     *  everything older has committed and nothing younger has */
++    if (inst->ifaRestartPC) {
++        DPRINTF(MinorExecute, "IFA restarting fault in inst: %s from: %s\n",
++            *inst, *inst->ifaRestartPC);
++        thread->pcState(*inst->ifaRestartPC);
++    }
++}
++
++Execute::IFARegState
++Execute::ifaRegState(ThreadID thread_id, const RegId &reg) const
++{
++    assert(ifaNeedsScoreboard);
++
++    const Scoreboard &snapshot = ifaScoreboardSnapshot[thread_id];
++    IFARegState state;
++    Scoreboard::Index index;
++
++    if (snapshot.findIndex(reg, index) && snapshot.numResults[index] != 0) {
++        int fu_index = snapshot.fuIndices[index];
++
++        state.pending = true;
++        /* Memory references hold their destinations in the scoreboard until
++         *  they commit, so this is exact even for cache misses */
++        state.memPending = snapshot.numUnpredictableResults[index] != 0 ||
++            (fu_index >= 0 && fu_index < numFuncUnits &&
++                funcUnits[fu_index]->provides(MemReadOp));
++        state.returnCycle = snapshot.returnCycle[index];
++    }
++
++    return state;
++}
++
++void
+ Execute::minorTrace() const
+ {
+     std::ostringstream insts;
+@@ -1965,8 +2064,23 @@
+ Execute::IssueStats::IssueStats(MinorCPU *cpu)
+     : statistics::Group(cpu),
+       ADD_STAT(issuedInstType, statistics::units::Count::get(),
+-               "Number of instructions issued per FU type, per thread")
+-{
++               "Number of instructions issued per FU type, per thread"),
++      ADD_STAT(issueStopCycles, statistics::units::Cycle::get(),
++               "Number of cycles by why Execute stopped issuing: Full ="
++               " issued executeIssueLimit instructions, NoInput = nothing"
++               " (more) to issue, Operands = sources of the next instruction"
++               " not ready, FU = no FU could take it, MemLimit ="
++               " executeMemoryIssueLimit reached")
++{
++    issueStopCycles.init(NumIssueStop)
++        .subname(IssueStopFull, "Full")
++        .subname(IssueStopNoInput, "NoInput")
++        .subname(IssueStopOperands, "Operands")
++        .subname(IssueStopFU, "FU")
++        .subname(IssueStopMemLimit, "MemLimit")
++        .subname(IssueStopOther, "Other")
++        .flags(statistics::total | statistics::pdf);
++
+     issuedInstType.init(cpu->numThreads, enums::Num_OpClass)
+         .flags(statistics::total | statistics::pdf | statistics::dist);
+     issuedInstType.ysubnames(enums::OpClassStrings);
+--- a/src/cpu/minor/scoreboard.hh
++++ b/src/cpu/minor/scoreboard.hh
+@@ -133,7 +133,7 @@
+     /** Sets scoreboard_index to the index into numResults of the
+      *  given register index.  Returns true if the given register
+      *  is in the scoreboard and false if it isn't */
+-    bool findIndex(const RegId& reg, Index &scoreboard_index);
++    bool findIndex(const RegId& reg, Index &scoreboard_index) const;
+ 
+     /** Mark up an instruction's effects by incrementing
+      *  numResults counts.  If mark_unpredictable is true, the inst's
+--- a/src/cpu/minor/scoreboard.cc
++++ b/src/cpu/minor/scoreboard.cc
+@@ -48,7 +48,7 @@
+ {
+ 
+ bool
+-Scoreboard::findIndex(const RegId& reg, Index &scoreboard_index)
++Scoreboard::findIndex(const RegId& reg, Index &scoreboard_index) const
+ {
+     bool ret = false;
+ 
+--- a/src/cpu/minor/pipeline.cc
++++ b/src/cpu/minor/pipeline.cc
+@@ -72,7 +72,7 @@
+         dToE.output(), eToF1.input()),
+     decode(cpu.name() + ".decode", cpu, params,
+         f2ToD.output(), dToE.input(), execute.inputBuffer),
+-    fetch2(cpu.name() + ".fetch2", cpu, params,
++    fetch2(cpu.name() + ".fetch2", cpu, params, execute,
+         f1ToF2.output(), eToF1.output(), f2ToF1.input(), f2ToD.input(),
+         decode.inputBuffer),
+     fetch1(cpu.name() + ".fetch1", cpu, params,
+--- a/configs/deprecated/example/se.py
++++ b/configs/deprecated/example/se.py
+@@ -134,6 +134,76 @@
+ Options.addCommonOptions(parser)
+ Options.addSEOptions(parser)
+ 
++parser.add_argument(
++    "--ifa-mode",
++    type=int,
++    default=0,
++    choices=[0, 1, 2],
++    help="Instruction Flow Amplifier (IFA) in the MinorCPU Fetch2 stage:"
++    " 0 = off (baseline), 1 = front-end buffer with in-order dispatch,"
++    " 2 = front-end buffer with out-of-order dispatch",
++)
++parser.add_argument(
++    "--ifa-buffer-size", type=int, default=16, help="IFA FEB entries"
++)
++parser.add_argument(
++    "--ifa-decode-width",
++    type=int,
++    default=0,
++    help="Instructions decoded into the IFA FEB per cycle (0: no limit)",
++)
++parser.add_argument(
++    "--ifa-latency",
++    type=int,
++    default=0,
++    help="Cycles an instruction spends in the IFA FEB before dispatch",
++)
++parser.add_argument(
++    "--ifa-dau-source",
++    default="IFAHybrid",
++    choices=["IFAShadow", "IFAScoreboard", "IFAHybrid"],
++    help="Where the IFA DAU finds in-flight producers",
++)
++parser.add_argument(
++    "--ifa-load-latency",
++    type=int,
++    default=4,
++    help="Load-to-use latency assumed by the IFA shadow scoreboard",
++)
++parser.add_argument(
++    "--ifa-issue-model",
++    action=argparse.BooleanOptionalAction,
++    default=True,
++    help="Schedule IFA dispatch with a model of Execute's in-order issue"
++    " (otherwise oldest ready first)",
++)
++parser.add_argument(
++    "--ifa-hoist-memory-refs",
++    action="store_true",
++    help="Let memory references pass older independent instructions",
++)
++parser.add_argument(
++    "--ifa-fill-when-blocked",
++    action=argparse.BooleanOptionalAction,
++    default=True,
++    help="Keep filling the IFA FEB while Decode is full",
++)
++parser.add_argument(
++    "--ifa-queue-aware",
++    action="store_true",
++    help="Include queued instructions in the IFA DAU's arrival estimate",
++)
++parser.add_argument(
++    "--ifa-pass-memory-refs",
++    action="store_true",
++    help="Let re-executable instructions pass older memory references",
++)
++parser.add_argument(
++    "--ifa-no-flush",
++    action="store_true",
++    help="Don't discard IFA FEB entries on stream changes",
++)
++
+ if "--ruby" in sys.argv:
+     Ruby.define_options(parser)
+ 
+@@ -221,6 +291,24 @@
+ for cpu in system.cpu:
+     cpu.clk_domain = system.cpu_clk_domain
+ 
++# Instruction Flow Amplifier (MinorCPU only)
++for cpu in system.cpu:
++    if "ifa_mode" in cpu._params:
++        cpu.ifa_mode = args.ifa_mode
++        cpu.ifa_buffer_size = args.ifa_buffer_size
++        cpu.ifa_decode_width = args.ifa_decode_width
++        cpu.ifa_latency = args.ifa_latency
++        cpu.ifa_dau_source = args.ifa_dau_source
++        cpu.ifa_load_latency = args.ifa_load_latency
++        cpu.ifa_flush_on_stream_change = not args.ifa_no_flush
++        cpu.ifa_pass_memory_refs = args.ifa_pass_memory_refs
++        cpu.ifa_hoist_memory_refs = args.ifa_hoist_memory_refs
++        cpu.ifa_issue_model = args.ifa_issue_model
++        cpu.ifa_fill_when_blocked = args.ifa_fill_when_blocked
++        cpu.ifa_queue_aware = args.ifa_queue_aware
++    elif args.ifa_mode != 0:
++        fatal(f"--ifa-mode needs a MinorCPU, not {type(cpu).__name__}")
++
+ if ObjectList.is_kvm_cpu(CPUClass) or ObjectList.is_kvm_cpu(FutureClass):
+     if buildEnv["USE_X86_ISA"]:
+         system.kvm_vm = KvmVM()

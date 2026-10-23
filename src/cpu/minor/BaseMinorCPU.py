@@ -298,13 +298,74 @@ class ThreadPolicy(Enum):
     vals = ["SingleThreaded", "RoundRobin", "Random"]
 
 
+class MinorIFADAUSource(Enum):
+    """Where the IFA's dependency analysis unit (DAU) looks for producers
+    which are still in flight: the shadow scoreboard kept in Fetch2,
+    Execute's scoreboard (as it was at the start of the cycle), or both"""
+
+    vals = ["IFAShadow", "IFAScoreboard", "IFAHybrid"]
+
+
 class BaseMinorCPU(BaseCPU):
     type = "BaseMinorCPU"
     cxx_header = "cpu/minor/cpu.hh"
     cxx_class = "gem5::MinorCPU"
 
-    enable_ifa = Param.Bool(False, "Enable Instruction Flow Accelerator (IFA) logic")
-    ifa_latency = Param.Cycles(3, "Latency overhead added by IFA analysis")
+    ifa_mode = Param.Unsigned(
+        0,
+        "Instruction Flow Amplifier (IFA) in Fetch2: 0 = off (baseline"
+        " MinorCPU), 1 = front-end buffer (FEB) with in-order dispatch,"
+        " 2 = FEB with out-of-order dispatch of the instructions the"
+        " dependency analysis unit finds ready",
+    )
+    ifa_buffer_size = Param.Unsigned(16, "Number of IFA FEB entries")
+    ifa_decode_width = Param.Unsigned(
+        0,
+        "Maximum number of instructions decoded into the IFA FEB each cycle"
+        " (0 means no limit other than FEB space and available input)",
+    )
+    ifa_latency = Param.Cycles(
+        0,
+        "Cycles an instruction spends in the IFA FEB before it can be"
+        " dispatched (0 means in the cycle it is decoded)",
+    )
+    ifa_flush_on_stream_change = Param.Bool(
+        True,
+        "Discard IFA FEB entries from the old stream when Execute changes"
+        " stream",
+    )
+    ifa_dau_source = Param.MinorIFADAUSource(
+        "IFAHybrid",
+        "Where the IFA DAU finds in-flight producers",
+    )
+    ifa_load_latency = Param.Cycles(
+        4, "Load-to-use latency assumed by the IFA shadow scoreboard"
+    )
+    ifa_issue_model = Param.Bool(
+        True,
+        "Choose the IFA dispatch order with a model of Execute's in-order"
+        " issue (the instruction which would issue earliest goes first)"
+        " instead of oldest-ready-first",
+    )
+    ifa_hoist_memory_refs = Param.Bool(
+        False,
+        "Let the IFA dispatch memory references before older instructions"
+        " they don't depend on (faults restart from the oldest of them)",
+    )
+    ifa_fill_when_blocked = Param.Bool(
+        True, "Keep decoding into the IFA FEB while Decode is full"
+    )
+    ifa_queue_aware = Param.Bool(
+        False,
+        "Count the instructions queued in Decode and Execute when the IFA"
+        " DAU estimates when an instruction will reach issue",
+    )
+    ifa_pass_memory_refs = Param.Bool(
+        False,
+        "Let the IFA dispatch instructions which can be safely executed"
+        " again before older memory references.  If the memory reference"
+        " faults, they are executed (and committed) again",
+    )
 
     @classmethod
     def memory_mode(cls):

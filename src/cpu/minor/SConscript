@@ -44,7 +44,7 @@ if env['CONF']['BUILD_ISA']:
     SimObject('BaseMinorCPU.py', sim_objects=[
         'MinorOpClass', 'MinorOpClassSet', 'MinorFUTiming', 'MinorFU',
         'MinorFUPool', 'BaseMinorCPU'],
-        enums=['ThreadPolicy'])
+        enums=['ThreadPolicy', 'MinorIFADAUSource'])
 
     Source('activity.cc')
     Source('cpu.cc')

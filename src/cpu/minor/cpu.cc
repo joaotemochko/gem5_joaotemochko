@@ -50,9 +50,7 @@ namespace gem5
 MinorCPU::MinorCPU(const BaseMinorCPUParams &params) :
     BaseCPU(params),
     threadPolicy(params.threadPolicy),
-    stats(this),
-    enableIFA(params.enable_ifa),
-    ifaLatency(params.ifa_latency)
+    stats(this)
 {
     /* This is only written for one thread at the moment */
     minor::MinorThread *thread;
@@ -82,14 +80,6 @@ MinorCPU::MinorCPU(const BaseMinorCPUParams &params) :
     activityRecorder = pipeline->getActivityRecorder();
 
     fetchEventWrapper = NULL;
-
-    // --- ADICIONE ISTO NO FINAL DO CONSTRUTOR ---
-    std::cout << "\n============================================" << std::endl;
-    std::cout << "DEBUG IFA STATUS para " << name() << ":" << std::endl;
-    std::cout << "  --> Enable IFA: " << (enableIFA ? "LIGADO (ON)" : "DESLIGADO (OFF)") << std::endl;
-    std::cout << "  --> Latency:    " << ifaLatency << " ciclos" << std::endl;
-    std::cout << "============================================\n" << std::endl;
-
 }
 
 MinorCPU::~MinorCPU()

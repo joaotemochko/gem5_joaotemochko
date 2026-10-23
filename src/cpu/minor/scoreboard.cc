@@ -48,7 +48,7 @@ namespace minor
 {
 
 bool
-Scoreboard::findIndex(const RegId& reg, Index &scoreboard_index)
+Scoreboard::findIndex(const RegId& reg, Index &scoreboard_index) const
 {
     bool ret = false;
 

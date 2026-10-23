@@ -96,8 +96,6 @@ class MinorCPU : public BaseCPU
      *  actually mediates idling behaviour */
     minor::MinorActivityRecorder *activityRecorder;
 
-    bool enableIFA;
-    Cycles ifaLatency;
     /** These are thread state-representing objects for this CPU.  If
      *  you need a ThreadContext for *any* reason, use
      *  threads[threadId]->getTC() */
